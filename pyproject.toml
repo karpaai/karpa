@@ -1,0 +1,45 @@
+[project]
+name = "karpathian"
+version = "0.1.0"
+description = "Karpathian — Bittensor subnet for decentralized autonomous AI research"
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "Apache-2.0"}
+authors = [
+    {name = "bitzic", email = "bitzylabs@gmail.com"},
+]
+
+dependencies = [
+    "torch>=2.4.0",
+    "numpy>=1.24.0",
+    "tiktoken>=0.7.0",
+    "cryptography>=42.0",
+]
+
+[project.optional-dependencies]
+data = [
+    "datasets>=2.19.0",
+    "huggingface-hub>=0.23.0",
+]
+dev = [
+    "pytest>=7.4",
+    "ruff>=0.4",
+]
+all = ["karpathian[data,dev]"]
+
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["model*", "recipe*", "data*", "eval*", "calibration*", "miner*", "validator*", "proof*"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
