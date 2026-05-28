@@ -163,15 +163,26 @@ def merge_and_release(
     if f"{owner}/{pr_repo}".lower() != repo.lower():
         raise RuntimeError(f"PR points at {owner}/{pr_repo}, refusing to merge into {repo}")
 
-    # 1. Merge the PR (squash)
+    # 1. Merge the PR (squash). Include a Co-authored-by trailer so the
+    # miner's GitHub account shows up on the recipe's Contributors graph
+    # and gets contribution credit on their own profile.
+    miner_gh = metrics.get("miner_github", "")
+    body_with_credit = _release_body(metrics, pr_url)
+    if miner_gh:
+        # GitHub recognises the `username@users.noreply.github.com` form as
+        # the canonical "no-reply" address for any user; commits credited to
+        # it count toward the user's contribution graph.
+        body_with_credit += (
+            f"\n\nCo-authored-by: {miner_gh} <{miner_gh}@users.noreply.github.com>"
+        )
     merge_resp = _gh(
         "PUT",
         f"/repos/{repo}/pulls/{num}/merge",
         token,
         {
             "merge_method": "squash",
-            "commit_title": f"recipe submission #{num} — {metrics.get('miner_github') or metrics.get('miner_hotkey', '')[:12]}",
-            "commit_message": _release_body(metrics, pr_url),
+            "commit_title": f"recipe submission #{num} — {miner_gh or metrics.get('miner_hotkey', '')[:12]}",
+            "commit_message": body_with_credit,
         },
     )
     merge_sha = merge_resp.get("sha", "")
