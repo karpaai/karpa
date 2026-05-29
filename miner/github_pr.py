@@ -196,16 +196,21 @@ def open_recipe_pr(
         # same bundle. The branch name is fully namespaced by bundle_hash
         # and lives on the miner's own fork, so an unconditional force is
         # safe and idempotent.
-        from urllib.parse import urlparse
+        # Auth: embed the PAT in the push URL. This is observable via
+        # `ps aux` for the push's duration — known limitation tracked as a
+        # followup (proper fix is a GIT_ASKPASS helper). _run() redacts the
+        # token from any exception messages via the secrets= tuple, and the
+        # token-bearing URL never lands in .git/config.
+        from urllib.parse import urlparse, urlunparse
         parsed = urlparse(fork_url)
-        # Strip any embedded creds defensively before using the URL on argv.
+        # Strip any embedded creds before re-injecting our token.
         plain_netloc = parsed.hostname or parsed.netloc
         if parsed.port:
             plain_netloc = f"{plain_netloc}:{parsed.port}"
-        plain_url = parsed._replace(netloc=plain_netloc).geturl()
-        extraheader = f"http.extraheader=Authorization: bearer {token}"
+        push_netloc = f"{token}@{plain_netloc}"
+        push_url = urlunparse(parsed._replace(netloc=push_netloc))
         _run(
-            ["git", "-c", extraheader, "push", "--force", plain_url, branch],
+            ["git", "push", "--force", push_url, branch],
             cwd=workdir,
             secrets=(token,),
         )
