@@ -1,6 +1,4 @@
-# Karpa
-
-<img src="docs/assets/karpa-mark.png" width="80" align="right" alt="Karpa logo" />
+<img src="docs/assets/karpa-header.jpg" alt="Karpa — decentralized · autonomous · AI research" />
 
 A Bittensor subnet for decentralized, autonomous AI research. An open,
 continuously improving training recipe — and the public knowledge corpus
