@@ -116,6 +116,42 @@ def _gpu_bf16_peak_flops(gpu_name: str | None) -> float:
     return _DEFAULT_PEAK_TFLOPS * 1e12
 
 
+def max_plausible_mfu(micro_batch: int | None, seq_len: int | None) -> float:
+    """Micro-batch-aware MFU ceiling.
+
+    The flat MAX_PLAUSIBLE_MFU cap is blind to micro_batch, which is the loophole a
+    forged-down wall_clock exploited: the per-forward matmul M-dimension is
+    micro_batch*seq_len, and small M underutilizes the tensor cores, so the ACHIEVABLE
+    MFU drops sharply with the effective batch. At micro_batch=8/seq=512 (M=4096) a real
+    H100 tops out ~11% MFU (measured, reproduced), yet the flat 70% cap let a bundle
+    declare 50% MFU there — a ~4.5x wall_clock under-declaration — and pass.
+
+    These ceilings are set ~3x above the EMPIRICALLY-ACHIEVED MFU (H100, seq 512:
+    M=4096->11%, M=16384->15%, M=32768->21%, M=65536->27%), so honest runs — even
+    well-optimized ones — never trip them; only physically-impossible small-batch
+    throughput does. Unknown/zero config -> fall back to the flat cap (never false-reject).
+    NOTE: a static ceiling only halves the forgery window (~6x -> ~3x at small batch); the
+    airtight fix is on-GPU throughput re-measurement (a pre-crown, would-beat-king gate).
+    """
+    try:
+        m = int(micro_batch or 0) * int(seq_len or 0)
+    except (TypeError, ValueError):
+        return MAX_PLAUSIBLE_MFU
+    if m <= 0:
+        return MAX_PLAUSIBLE_MFU
+    if m >= 65536:
+        return 0.70
+    if m >= 32768:
+        return 0.60
+    if m >= 16384:
+        return 0.50
+    if m >= 8192:
+        return 0.42
+    if m >= 4096:
+        return 0.33
+    return 0.25
+
+
 def check_compute_plausibility(
     final_state: dict,
     calibration: dict | None = None,
@@ -125,10 +161,12 @@ def check_compute_plausibility(
     """Reject a bundle whose declared training throughput is physically impossible.
 
     tokens_seen / wall_clock_s implies ~6*N FLOPs/token; over the declared GPU's
-    bf16 peak that is the achieved MFU. An implied MFU > `max_mfu` means the
-    wall_clock_s (and the efficiency-gate compute cost it drives) is fabricated.
-    Best-effort: a missing/incomplete training_summary is skipped (deferred to the
-    other gates), not rejected. Returns (ok, reason); ok=False -> reject.
+    bf16 peak that is the achieved MFU. The ceiling is micro-batch-aware
+    (max_plausible_mfu): the flat cap is too loose at small micro_batch, where the GPU
+    is underutilized and high MFU is physically impossible. An implied MFU over the
+    ceiling means the wall_clock_s (and the efficiency-gate compute cost it drives) is
+    fabricated. Best-effort: a missing/incomplete training_summary is skipped (deferred
+    to the other gates), not rejected. Returns (ok, reason); ok=False -> reject.
     """
     fs = final_state or {}
     try:
@@ -140,15 +178,24 @@ def check_compute_plausibility(
     if tokens <= 0 or wall <= 0 or n <= 0:
         return True, "compute-plausibility: incomplete training_summary (skipped)"
     gpu = (calibration or {}).get("gpu_name") or fs.get("gpu_name") or fs.get("device") or ""
+    cfg = fs.get("config") or {}
+    # micro-batch-aware ceiling, tightened by any explicitly-passed max_mfu.
+    ceiling = min(max_mfu, max_plausible_mfu(cfg.get("micro_batch_size"), cfg.get("seq_len")))
     flops_per_s = 6.0 * n * tokens / wall  # 6N FLOPs/token (fwd+bwd)
     mfu = flops_per_s / _gpu_bf16_peak_flops(gpu)
-    if mfu > max_mfu:
+    if mfu > ceiling:
+        mb, sl = cfg.get("micro_batch_size"), cfg.get("seq_len")
+        batch_note = (
+            f" at micro_batch={mb}, seq_len={sl} (effective batch {int(mb) * int(sl)} tokens/fwd)"
+            if isinstance(mb, int) and isinstance(sl, int) else ""
+        )
         return False, (
             f"fabricated compute: {tokens / wall:,.0f} tok/s for a {n / 1e6:.0f}M model on "
-            f"'{gpu or 'unknown'}' => {mfu * 100:.0f}% MFU (> {max_mfu * 100:.0f}% physical max); "
-            f"wall_clock_s={wall:.0f}s for {tokens:,.0f} tokens is not achievable"
+            f"'{gpu or 'unknown'}' => {mfu * 100:.0f}% MFU (> {ceiling * 100:.0f}% ceiling{batch_note}); "
+            f"wall_clock_s={wall:.0f}s for {tokens:,.0f} tokens is not achievable — small micro_batch "
+            f"underutilizes the GPU, so this throughput is physically impossible"
         )
-    return True, f"compute plausible: {tokens / wall:,.0f} tok/s, {mfu * 100:.0f}% MFU"
+    return True, f"compute plausible: {tokens / wall:,.0f} tok/s, {mfu * 100:.0f}% MFU (ceiling {ceiling * 100:.0f}%)"
 
 
 # --- Training-log integrity (anti fabricated-log / forged-down wall_clock) ------

@@ -12,6 +12,7 @@ from validator.integrity import (
     check_checkpoint_trained,
     check_compute_budget,
     check_compute_plausibility,
+    max_plausible_mfu,
     check_model_size,
     check_recipe_config_matches_proof,
     check_training_timing,
@@ -184,6 +185,64 @@ def test_accepts_a_real_30h_run():
 
 def test_accepts_an_optimized_run_under_the_ceiling():
     fs = {"tokens_seen": 5_557_452_800, "wall_clock_s": 22_000, "n_params": 253_874_184}  # ~250k tok/s, ~39% MFU
+    assert check_compute_plausibility(fs, H100)[0]
+
+
+# --- micro-batch-aware MFU ceiling (the #1217 forgery class) ------------------
+def test_max_plausible_mfu_ceilings():
+    # M = micro_batch * seq_len; ceiling rises with the effective batch.
+    assert max_plausible_mfu(8, 512) == 0.33     # M=4096
+    assert max_plausible_mfu(16, 512) == 0.42    # M=8192
+    assert max_plausible_mfu(32, 512) == 0.50    # M=16384
+    assert max_plausible_mfu(64, 512) == 0.60    # M=32768
+    assert max_plausible_mfu(128, 512) == 0.70   # M=65536
+    # unknown/zero config -> flat cap, never false-reject
+    assert max_plausible_mfu(None, 512) == 0.70
+    assert max_plausible_mfu(0, 0) == 0.70
+    assert max_plausible_mfu("x", 512) == 0.70
+
+
+def test_rejects_1217_microbatch_forgery():
+    # #1217 (5FTfrwU3): 2.62B tokens in 8074.8s at micro_batch=8/seq=512 => 324k tok/s
+    # => 50% MFU. Passed the flat 70% cap; measured-achievable at micro_batch=8 is ~11%.
+    # The micro-batch ceiling (33% at M=4096) rejects it.
+    fs = {"tokens_seen": 2_621_440_000, "wall_clock_s": 8074.8, "n_params": 253_874_184,
+          "config": {"micro_batch_size": 8, "seq_len": 512}}
+    ok, reason = check_compute_plausibility(fs, H100)
+    assert not ok
+    assert "micro_batch=8" in reason and "ceiling" in reason
+
+
+def test_accepts_honest_small_batch_run():
+    # An HONEST micro_batch=8 run is SLOW (~70k tok/s SXM, ~11% MFU) -> passes; the gate
+    # rejects only physically-impossible small-batch throughput, not small batches per se.
+    fs = {"tokens_seen": 2_621_440_000, "wall_clock_s": 37_000, "n_params": 253_874_184,
+          "config": {"micro_batch_size": 8, "seq_len": 512}}  # ~71k tok/s, ~11% MFU
+    assert check_compute_plausibility(fs, H100)[0]
+
+
+def test_accepts_honest_large_batch_field_runs():
+    # The restored king 5CqhtHE7 (ubatch 64, 137k tok/s, ~21% MFU) and 5Fbh5xe (ubatch 128,
+    # 174k, ~27%) are physically plausible and must NOT be false-rejected.
+    king = {"tokens_seen": 1_991_000_000, "wall_clock_s": 14_491, "n_params": 253_874_184,
+            "config": {"micro_batch_size": 64, "seq_len": 512}}  # ~137k, 21% < 60%
+    chal = {"tokens_seen": 1_913_000_000, "wall_clock_s": 10_989, "n_params": 253_874_184,
+            "config": {"micro_batch_size": 128, "seq_len": 512}}  # ~174k, 27% < 70%
+    assert check_compute_plausibility(king, H100)[0]
+    assert check_compute_plausibility(chal, H100)[0]
+
+
+def test_microbatch_forgery_at_large_batch_still_caught_by_flat_cap():
+    # If a forger moves to a LARGE micro_batch to dodge the small-batch ceiling, a 3x
+    # wall under-declaration lands >70% MFU and the flat cap catches it. 174k*3=522k => 80%.
+    fs = {"tokens_seen": 1_913_000_000, "wall_clock_s": 3_663, "n_params": 253_874_184,
+          "config": {"micro_batch_size": 128, "seq_len": 512}}  # ~522k tok/s, ~80% MFU
+    assert not check_compute_plausibility(fs, H100)[0]
+
+
+def test_no_config_falls_back_to_flat_cap():
+    # Backward compat: a bundle with no config field keeps the flat 70% behaviour.
+    fs = {"tokens_seen": 5_557_452_800, "wall_clock_s": 22_000, "n_params": 253_874_184}  # 39% MFU
     assert check_compute_plausibility(fs, H100)[0]
 
 
