@@ -12,11 +12,11 @@ from validator.integrity import (
     check_checkpoint_trained,
     check_compute_budget,
     check_compute_plausibility,
-    max_plausible_mfu,
     check_model_size,
     check_recipe_config_matches_proof,
     check_training_timing,
     compare_loss_trajectory,
+    max_plausible_mfu,
     nats_per_token_from_bpb,
 )
 
