@@ -23,7 +23,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from validator.scoring import score_bundle
-from validator.validator import judge_submission
+from validator.validator import judge_submission, op_rederive_trajectory
 
 
 def _chain_dir(ralph_root: Path) -> Path:
@@ -126,6 +126,22 @@ def process_submission(
     is_first = king is None and hwm is None
     accepted = score.decisively_beats_king if bar else False
 
+    # Pre-crown proof-of-EXECUTION: re-run the first steps on CANONICAL data and require
+    # the declared loss trajectory to reproduce. Run ONLY for a bundle that would take the
+    # crown, so cost is O(king-changes) not O(submissions). off/shadow never block a crown
+    # (shadow logs the verdict for calibration); enforce withholds the crown on a genuine
+    # trajectory mismatch. Every ambiguity (disabled, no canonical data, timeout, too-few
+    # points) stays fail-OPEN, so a validator glitch never wrongly withholds a crown, and a
+    # failed re-derivation only PREVENTS a promotion — it never dethrones the sitting king.
+    rederive_blocked = False
+    if accepted or is_first:
+        ok_rd, detail_rd = op_rederive_trajectory(ralph_root, proof_dir)
+        result.operations["op_rederive"] = {"ok": ok_rd, "detail": detail_rd}
+        if not ok_rd:
+            rederive_blocked = True
+            accepted = False
+            is_first = False
+
     event = {
         "type": "submission_scored",
         "timestamp": time.time(),
@@ -140,6 +156,7 @@ def process_submission(
         "score": score.score,
         "decisively_beats_king": score.decisively_beats_king,
         "accepted_as_king": accepted or is_first,
+        "rederive_blocked": rederive_blocked,
         "operations": result.operations,
     }
     _append_event(ralph_root, event)
@@ -166,8 +183,14 @@ def process_submission(
             "new_king": new_king,
         })
 
+    if accepted or is_first:
+        status = "accepted"
+    elif rederive_blocked:
+        status = "rederive_withheld"
+    else:
+        status = "below_threshold"
     return {
-        "status": "accepted" if (accepted or is_first) else "below_threshold",
+        "status": status,
         "result": result.to_dict(),
         "score": asdict(score),
         "event": event,

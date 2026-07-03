@@ -1410,6 +1410,50 @@ def _read_training_log_points(log_path: Path, max_step: int | None = None) -> li
     return out
 
 
+def _rederive_mode() -> str:
+    """RALPH_REDERIVE selects the re-derivation regime:
+      off (default) -> gate never runs;
+      shadow        -> gate RUNS + logs the verdict but NEVER blocks a crown
+                       (calibration data collection on a live box, cannot false-reject);
+      enforce (=1)  -> a trajectory mismatch blocks the crown (fail-closed on POSITIVE
+                       mismatch only; every ambiguity stays fail-OPEN skip).
+    """
+    import os
+    v = os.environ.get("RALPH_REDERIVE", "").strip().lower()
+    if v in ("1", "on", "true", "enforce"):
+        return "enforce"
+    if v == "shadow":
+        return "shadow"
+    return "off"
+
+
+def _rederive_tols() -> tuple[float, float, float]:
+    """(step0_tol, abs_tol, rel_tol) for compare_loss_trajectory, env-tunable so the
+    honest cross-GPU/bf16 spread can be calibrated during shadow without a code change.
+    Defaults match the compare_loss_trajectory defaults."""
+    import os
+
+    def _f(name: str, default: float) -> float:
+        try:
+            return float(os.environ.get(name, "") or default)
+        except ValueError:
+            return default
+
+    return (
+        _f("RALPH_REDERIVE_STEP0_TOL", 0.10),
+        _f("RALPH_REDERIVE_ABS_TOL", 0.40),
+        _f("RALPH_REDERIVE_REL_TOL", 0.10),
+    )
+
+
+def _apply_rederive_mode(mode: str, ok_v: bool, detail_v: str) -> tuple[bool, str]:
+    """shadow NEVER gates: return PASS but surface the would-be verdict for the audit
+    log + calibration. enforce returns the real verdict."""
+    if mode == "shadow":
+        return True, f"[shadow] would_gate={'PASS' if ok_v else 'FAIL'}: {detail_v}"
+    return ok_v, detail_v
+
+
 def op_rederive_trajectory(ralph_root: Path, proof_dir: Path) -> tuple[bool, str]:
     """Pre-crown proof-of-EXECUTION: re-run the FIRST few steps of the declared
     training on CANONICAL data and require the loss trajectory to reproduce.
@@ -1420,12 +1464,13 @@ def op_rederive_trajectory(ralph_root: Path, proof_dir: Path) -> tuple[bool, str
     train.py with the miner's exact config+seed but pinned to CANONICAL data, collect the
     first few logged points, and compare the trajectory (validator.integrity.compare_loss_trajectory).
 
-    OFF by default (RALPH_REDERIVE=1 to enable). Fail-OPEN (skip) when disabled or when the
-    canonical training data is not materialized on the validator — enable only AFTER
-    materializing data/data_manifest.json + shards and calibrating the tolerance band on a
-    known-honest bundle. Expensive (GPU-minutes); the caller should run it only on a bundle
-    that would actually beat the king. NOTE: written but UNVALIDATED until canonical data
-    exists on a validator to run it against.
+    Regime via RALPH_REDERIVE (_rederive_mode): off (default) / shadow / enforce. Runs
+    only when the canonical data are materialized on the validator; otherwise fail-OPEN
+    skip. In shadow it always returns (True, "[shadow] ...") so it can NEVER block — used
+    to collect the honest cross-GPU trajectory spread before calibrating the tolerance
+    band. Tolerances are env-tunable (RALPH_REDERIVE_STEP0_TOL / _ABS_TOL / _REL_TOL) so
+    calibration needs no code change. Expensive (GPU-minutes); the CALLER runs it only for
+    a bundle that would actually beat the king (cost is O(king-changes), not O(submissions)).
     """
     import os
     import shutil
@@ -1433,8 +1478,9 @@ def op_rederive_trajectory(ralph_root: Path, proof_dir: Path) -> tuple[bool, str
     import tempfile
     import time
 
-    if os.environ.get("RALPH_REDERIVE") != "1":
-        return True, "re-derivation disabled (RALPH_REDERIVE!=1)"
+    mode = _rederive_mode()
+    if mode == "off":
+        return True, "re-derivation disabled (RALPH_REDERIVE off)"
     from ralph_bootstrap import RECIPE_DIR
 
     canon_manifest = RECIPE_DIR / "data" / "data_manifest.json"
@@ -1482,6 +1528,12 @@ def op_rederive_trajectory(ralph_root: Path, proof_dir: Path) -> tuple[bool, str
         train_py = workdir / "recipe" / "train.py"
         if not train_py.exists():
             return True, "re-derivation skipped: recipe/train.py not found in workdir"
+        # Do NOT pass --seed: train.py --seed clobbers BOTH init_seed AND data_seed
+        # (recipe/train.py main()), so collapsing them here would give an honest miner
+        # whose run used init_seed != data_seed different init weights AND a different
+        # data order on re-derivation -> a guaranteed step-0 false-reject. The full cfg
+        # (with the miner's real, distinct init_seed + data_seed) is already written to
+        # cfg_file and applied via --config, so re-derivation reproduces the exact run.
         cmd = [
             sys.executable, str(train_py),
             "--config", str(cfg_file),
@@ -1489,9 +1541,6 @@ def op_rederive_trajectory(ralph_root: Path, proof_dir: Path) -> tuple[bool, str
             "--data-base-dir", str((RECIPE_DIR / "data").resolve()),
             "--out-dir", str(out_dir),
         ]
-        seed = cfg.get("init_seed", cfg.get("data_seed"))
-        if seed is not None:
-            cmd += ["--seed", str(int(seed))]
 
         env = _sanitized_env(extra={"PYTHONPATH": str(workdir)})
         timeout_s = int(os.environ.get("RALPH_REDERIVE_TIMEOUT_S", "1200"))
@@ -1522,7 +1571,12 @@ def op_rederive_trajectory(ralph_root: Path, proof_dir: Path) -> tuple[bool, str
             return True, f"re-derivation inconclusive: only {len(rederived)} point(s) produced in {timeout_s}s (skip)"
 
     from validator.integrity import compare_loss_trajectory
-    return compare_loss_trajectory(declared, rederived)
+
+    step0_tol, abs_tol, rel_tol = _rederive_tols()
+    ok_v, detail_v = compare_loss_trajectory(
+        declared, rederived, step0_tol=step0_tol, abs_tol=abs_tol, rel_tol=rel_tol,
+    )
+    return _apply_rederive_mode(mode, ok_v, detail_v)
 
 
 def op4_hidden_eval(
@@ -1618,19 +1672,12 @@ def judge_submission(
         result.rejected = ValidatorReject("op3_log_plausibility", detail)
         return result
 
-    # Pre-crown proof-of-EXECUTION (OFF by default; RALPH_REDERIVE=1). Re-runs the
-    # first training steps on CANONICAL data and requires the loss trajectory to
-    # reproduce — the only check that off-protocol training can't satisfy without
-    # actually running the canonical recipe. Skips cleanly when disabled or when the
-    # canonical data isn't materialized. Expensive: for efficiency the crown path
-    # should ideally invoke this only for a bundle that would beat the king (it still
-    # short-circuits behind op1-op3 here).
-    ok, detail = op_rederive_trajectory(ralph_root, proof_dir)
-    result.operations["op_rederive"] = {"ok": ok, "detail": detail}
-    if not ok:
-        result.rejected = ValidatorReject("op_rederive_trajectory", detail)
-        return result
-
+    # NOTE: proof-of-EXECUTION re-derivation (op_rederive_trajectory) is intentionally
+    # NOT run here. It is expensive (GPU-minutes) and only meaningful for a bundle that
+    # would actually take the crown, so the caller (validator.router.process_submission)
+    # invokes it as a pre-crown gate — AFTER op4 scores the bundle and ONLY when it beats
+    # the king. Running it per-submission here would be O(submissions) GPU cost + a DoS
+    # surface for any op1-op3-passing bundle.
     ok, detail, hidden_eval = op4_hidden_eval(ralph_root, proof_dir, chain=chain)
     result.operations["op4_hidden_eval"] = {"ok": ok, "detail": detail}
     if not ok:
