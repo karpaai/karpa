@@ -165,6 +165,13 @@ def score_bundle(
     decisively_beats_king=False and quality_gain/benchmark_gain zero so the
     caller can reject without crowning a null king.
     """
+    # The in-container benchmark_accuracy is blind-forgeable until the host-reduced
+    # benchmark is enforced (a score=-token_id sweep beats chance on a non-content-
+    # whitened active_benchmark.json). So benchmark_gain is NEUTRALIZED in the crown
+    # by default: it can neither crown a challenger (Branch C) nor mask a quality
+    # regression (the benchmark-no-regress guards go vacuous). val_bpb quality_gain
+    # alone decides. Re-enable once the benchmark is host-reduced: RALPH_BENCHMARK_CROWN=1.
+    _bench_crown = os.environ.get("RALPH_BENCHMARK_CROWN") == "1"
     finite_metrics = (
         isinstance(val_bpb, (int, float)) and math.isfinite(val_bpb)
         and isinstance(benchmark_accuracy, (int, float)) and math.isfinite(benchmark_accuracy)
@@ -181,16 +188,16 @@ def score_bundle(
         # challenger that regressed past the noise floor on the OTHER axis:
         #   Branch A: dominant quality (≥3× noise) AND benchmark-no-regress
         #   Branch B: quality > noise              AND benchmark-no-regress
-        #   Branch C: benchmark > noise            AND quality-no-regress
+        #   Branch C: benchmark > noise            AND quality-no-regress  (bench-crown only)
         # The Branch A guard (the AND ... clause) is the v0.10 Goodhart fix.
-        # See the constant docstring above for the seed-search vector it closes.
+        _bg = benchmark_gain if _bench_crown else 0.0
         decisively = (
             (quality_gain >= DOMINANT_QUALITY_MULTIPLIER * noise_floor_margin
-             and benchmark_gain >= -noise_floor_margin)
+             and _bg >= -noise_floor_margin)
             or
-            (quality_gain > noise_floor_margin and benchmark_gain >= -noise_floor_margin)
+            (quality_gain > noise_floor_margin and _bg >= -noise_floor_margin)
             or
-            (benchmark_gain > noise_floor_margin and quality_gain >= -noise_floor_margin)
+            (_bench_crown and benchmark_gain > noise_floor_margin and quality_gain >= -noise_floor_margin)
         )
 
     if cost_weight is None:
@@ -201,7 +208,7 @@ def score_bundle(
 
     score = (
         bpb_weight * quality_gain
-        + benchmark_weight * benchmark_gain
+        + (benchmark_weight * benchmark_gain if _bench_crown else 0.0)
         - cost_weight * cost_effective
     )
 

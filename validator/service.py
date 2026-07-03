@@ -1427,6 +1427,66 @@ def _generate_audit_report(
     )
 
 
+def _benchmark_selftest(ralph_root: Path) -> None:
+    """Startup blind-forgeability check for the deployed benchmark (anti-gaming P0).
+
+    If active_benchmark.json is content-forgeable (a blind score=+/-token_id sweep
+    beats chance) AND the benchmark crown is enabled (RALPH_BENCHMARK_CROWN=1),
+    REFUSE to start — running a gameable crown is worse than not starting; the
+    operator must regenerate a content-whitened benchmark first. If the crown is off
+    (the default), the scoring neutralization already protects the crown, so just
+    warn. A self-test *error* (bad file / missing dep) never blocks startup.
+    """
+    try:
+        from eval.benchmark import benchmark_blind_forgeable
+
+        bp = ralph_root / "eval" / "private" / "active_benchmark.json"
+        if not bp.exists():
+            return
+        forge, why = benchmark_blind_forgeable(json.loads(bp.read_text()))
+        if forge and os.environ.get("RALPH_BENCHMARK_CROWN") == "1":
+            raise SystemExit(
+                f"REFUSING TO START: benchmark self-test failed — {why}. "
+                "RALPH_BENCHMARK_CROWN=1 with a forgeable active_benchmark.json is "
+                "exploitable; regenerate a content-whitened benchmark or unset "
+                "RALPH_BENCHMARK_CROWN."
+            )
+        (log_warn if forge else log_info)(f"benchmark self-test: {why}")
+    except SystemExit:
+        raise
+    except Exception as e:  # noqa: BLE001 — a self-test *error* must never block startup
+        log_warn(f"benchmark self-test skipped: {e}")
+
+
+def _run_idle_audit(chain, ralph_root: Path, noise_floor_margin: float):
+    """Drain ONE pending audit job on an idle epoch (no submissions scored).
+
+    Was dead code (run_pending_audits called nowhere -> 0 fraud/blacklist events).
+    On a re-derivation mismatch run_pending_audits appends submission_fraud + blacklists
+    the miner. Off: RALPH_AUDIT_LOOP_OFF=1 (default on). NOTE the audit is a proxy re-run
+    until canonical-data / checkpoint-bound re-derivation land (plan P2/P4). Returns the
+    run_pending_audits result dict, or None if disabled/errored.
+    """
+    if os.environ.get("RALPH_AUDIT_LOOP_OFF") == "1":
+        return None
+    try:
+        from validator.audit_scheduler import run_pending_audits
+
+        a = run_pending_audits(
+            chain, ralph_root, ralph_root / "chain",
+            noise_floor_margin=noise_floor_margin, limit=1,
+        )
+        if a.get("processed"):
+            log_info(
+                f"audit: processed {a['processed']} "
+                f"(passed {a.get('passed', 0)}, failed {a.get('failed', 0)})"
+            )
+        return a
+    except Exception as e:  # noqa: BLE001 — audit must never crash the epoch loop
+        log_warn(f"audit loop error: {e}")
+        return None
+
+
 def main():
     p = argparse.ArgumentParser(description="Ralph continuous validator service")
     p.add_argument("--queue-dir", type=Path, default=RALPH_ROOT / "queue")
@@ -1485,6 +1545,10 @@ def main():
     else:
         log_info("HF Hub poll: disabled")
     log_info(f"submit bundles to: {args.queue_dir / 'pending' / '<bundle_id>/'}")
+    # Benchmark blind-forgeability self-test (anti-gaming P0). Warns if the deployed
+    # active_benchmark.json is content-forgeable; REFUSES to start if it's forgeable
+    # AND the crown is enabled (RALPH_BENCHMARK_CROWN=1) — see _benchmark_selftest.
+    _benchmark_selftest(RALPH_ROOT)
     log_info("")
 
     epoch = 0
@@ -1510,6 +1574,9 @@ def main():
                          f"{result['accepted']} accepted, {result['rejected']} rejected{mf_str}")
             else:
                 log_info(f"epoch {epoch}: no pending submissions")
+                # Idle: drain ONE pending audit job (was dead code -> 0 fraud events).
+                # See _run_idle_audit; off via RALPH_AUDIT_LOOP_OFF=1.
+                _run_idle_audit(chain, RALPH_ROOT, args.noise_floor)
         except Exception as e:
             log_err(f"epoch {epoch} failed: {e}")
             log_debug(traceback.format_exc())

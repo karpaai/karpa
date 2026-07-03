@@ -48,11 +48,13 @@ def test_not_decisive_inside_noise_band():
     assert sr.decisively_beats_king is False
 
 
-def test_not_decisive_when_bench_regresses_and_quality_below_dominant():
+def test_not_decisive_when_bench_regresses_and_quality_below_dominant(monkeypatch):
     """bpb wins past noise but BELOW DOMINANT_QUALITY_MULTIPLIER, and bench
     regresses past -noise — not decisive. The quality_gain (0.02 ≈ 1.5x
     noise) doesn't clear the dominant-quality branch (3x noise = 0.039)
-    and the paired-axes branch fails because bench drop is too large."""
+    and the paired-axes branch fails because bench drop is too large.
+    (Legacy benchmark-in-crown behavior — now behind RALPH_BENCHMARK_CROWN.)"""
+    monkeypatch.setenv("RALPH_BENCHMARK_CROWN", "1")
     sr = score_bundle(
         val_bpb=1.48,                # 0.02 better — above noise, below dominant
         benchmark_accuracy=0.40,     # 0.05 worse — outside -noise_floor
@@ -64,7 +66,7 @@ def test_not_decisive_when_bench_regresses_and_quality_below_dominant():
     assert sr.decisively_beats_king is False
 
 
-def test_v0_10_branch_a_no_longer_crowns_when_bench_regresses():
+def test_v0_10_branch_a_no_longer_crowns_when_bench_regresses(monkeypatch):
     """v0.10 Goodhart closure: under the GUARDED dominant-quality clause, a
     big quality_gain (~6x noise) does NOT crown if benchmark regressed past
     the noise floor. This is the seed-search backdoor the v0.10 fix closes
@@ -74,7 +76,9 @@ def test_v0_10_branch_a_no_longer_crowns_when_bench_regresses():
     the v0.10 guard the case is plain_failure because the benchmark drop
     indicates the win may be spurious. Branch B and Branch C also fail
     (Branch B needs benchmark-no-regress; Branch C needs benchmark > noise).
+    (Legacy benchmark-in-crown behavior — now behind RALPH_BENCHMARK_CROWN.)
     """
+    monkeypatch.setenv("RALPH_BENCHMARK_CROWN", "1")
     sr = score_bundle(
         val_bpb=1.42,                # 0.08 better — well above 3x noise
         benchmark_accuracy=0.40,     # 0.05 worse — outside -noise_floor
@@ -117,10 +121,11 @@ def test_dominant_quality_threshold_just_above_3x_noise():
     assert sr.decisively_beats_king is True
 
 
-def test_dominant_quality_threshold_does_not_fire_just_below():
+def test_dominant_quality_threshold_does_not_fire_just_below(monkeypatch):
     """Boundary the other side: 2.9x noise (below 3x) doesn't trigger the
     dominant-quality branch. If bench also regresses past -noise the
     submission falls back to non-decisive."""
+    monkeypatch.setenv("RALPH_BENCHMARK_CROWN", "1")
     sr = score_bundle(
         val_bpb=1.4623,              # gain = 0.0377 = 2.9 * 0.013
         benchmark_accuracy=0.00,     # bench tanked
@@ -132,9 +137,10 @@ def test_dominant_quality_threshold_does_not_fire_just_below():
     assert sr.decisively_beats_king is False
 
 
-def test_decisive_via_benchmark_axis():
-    """Benchmark wins, val_bpb roughly tied — decisive via the benchmark
-    arm of the OR-of-AND condition."""
+def test_decisive_via_benchmark_axis(monkeypatch):
+    """Benchmark wins, val_bpb roughly tied — decisive via the benchmark arm of
+    the OR-of-AND condition. (Legacy behavior — now behind RALPH_BENCHMARK_CROWN.)"""
+    monkeypatch.setenv("RALPH_BENCHMARK_CROWN", "1")
     sr = score_bundle(
         val_bpb=1.50,  # tied
         benchmark_accuracy=0.50,  # 0.05 better — outside noise floor
@@ -144,6 +150,22 @@ def test_decisive_via_benchmark_axis():
         matmul_ms=5.0, wall_clock_s=60.0,
     )
     assert sr.decisively_beats_king is True
+
+
+def test_benchmark_neutralized_by_default(monkeypatch):
+    """Default (no RALPH_BENCHMARK_CROWN): the forgeable in-container benchmark can
+    neither crown a challenger alone (Branch C gone) nor block a genuine val_bpb win."""
+    monkeypatch.delenv("RALPH_BENCHMARK_CROWN", raising=False)
+    # bench-only "win", val_bpb tied -> NO crown.
+    assert score_bundle(
+        val_bpb=1.50, benchmark_accuracy=0.50, king_val_bpb=1.5, king_benchmark=0.45,
+        noise_floor_margin=0.013, matmul_ms=5.0, wall_clock_s=60.0,
+    ).decisively_beats_king is False
+    # val_bpb win with benchmark tanked -> STILL crowns (benchmark ignored).
+    assert score_bundle(
+        val_bpb=1.42, benchmark_accuracy=0.0, king_val_bpb=1.5, king_benchmark=0.45,
+        noise_floor_margin=0.013, matmul_ms=5.0, wall_clock_s=60.0,
+    ).decisively_beats_king is True
 
 
 def test_nan_val_bpb_not_decisive():

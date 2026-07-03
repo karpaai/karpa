@@ -78,3 +78,49 @@ def make_placeholder_examples(
             "distractors": distractors,
         })
     return examples
+
+
+def benchmark_blind_forgeable(examples: list[dict], sigma: float = 3.0) -> tuple[bool, str]:
+    """Detect a non-content-whitened (blind-forgeable) benchmark file.
+
+    compute_benchmark_score ranks [target_id] + distractors by the model's logits.
+    If the correct target is distinguishable from the distractors by a monotone
+    function of the token-id alone (e.g. targets are systematically small while
+    distractors are uniform), a model that never learned anything wins by scoring
+    `-token_id` — the exact 0.785-vs-0.2 break found on the deployed file. A
+    content-whitened file (make_placeholder_examples: target + distractors from one
+    exchangeable rng.choice pool, uniform target slot) makes every blind monotone
+    score chance-level.
+
+    Returns (forgeable, reason). forgeable=True -> the file must be regenerated
+    with make_placeholder_examples before it can gate the crown.
+    """
+    import numpy as np
+
+    if not examples:
+        return False, "empty benchmark (nothing to forge)"
+    n = len(examples)
+    k = 1 + len(examples[0].get("distractors", []))
+    if k <= 1:
+        return False, "single-candidate benchmark"
+    chance = 1.0 / k
+    sd = (chance * (1.0 - chance) / n) ** 0.5
+    bar = chance + sigma * sd
+    worst = 0.0
+    worst_label = ""
+    for sign, label in ((-1.0, "-id"), (1.0, "+id")):
+        correct = 0
+        for e in examples:
+            cands = [e["target_id"]] + list(e["distractors"])
+            if int(np.argmax([sign * float(t) for t in cands])) == 0:
+                correct += 1
+        acc = correct / n
+        if acc > worst:
+            worst, worst_label = acc, label
+    if worst > bar:
+        return True, (
+            f"blind-forgeable benchmark: score={worst_label} sweep scores {worst:.3f} "
+            f"> chance {chance:.3f} + {sigma:.0f}sigma ({bar:.3f}); regenerate "
+            f"active_benchmark.json with the content-whitened make_placeholder_examples"
+        )
+    return False, f"benchmark not blind-forgeable (worst blind ±id = {worst:.3f} <= {bar:.3f})"
