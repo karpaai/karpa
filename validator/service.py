@@ -45,7 +45,7 @@ from chain_layer.config import get_chain
 from validator.hf_poller import DEFAULT_REPO as DEFAULT_HF_REPO
 from validator.hf_poller import poll_hub
 from validator.scoring import score_bundle
-from validator.validator import judge_submission
+from validator.validator import judge_submission, op_rederive_trajectory
 
 
 # Bittensor's bt.logging hijacks Python's logging module and raises the root
@@ -428,6 +428,22 @@ def score_and_decide(
     is_first = king is None and hwm is None
     decisively = score.decisively_beats_king or is_first
 
+    # Pre-crown proof-of-EXECUTION: re-run the first steps on the validator's CANONICAL
+    # data and require the declared loss trajectory to reproduce. Run ONLY for a would-be
+    # king, so cost is O(king-changes) not O(submissions). off/shadow never block (shadow
+    # logs the verdict for calibration); enforce withholds the crown on a genuine
+    # trajectory mismatch. Every ambiguity (disabled / no canonical data / timeout /
+    # too-few points) stays fail-OPEN, and a failed verdict only PREVENTS this promotion —
+    # it never dethrones the sitting king or auto-blacklists.
+    rederive_withheld = False
+    if decisively:
+        ok_rd, detail_rd = op_rederive_trajectory(RALPH_ROOT, bundle_dir)
+        result.operations["op_rederive"] = {"ok": ok_rd, "detail": detail_rd}
+        if not ok_rd:
+            rederive_withheld = True
+            decisively = False
+            is_first = False
+
     classification, weight_credit = _classify_outcome(
         decisively=decisively,
         val_bpb=result.hidden_eval.val_bpb,
@@ -436,7 +452,9 @@ def score_and_decide(
         bundle_dir=bundle_dir,
     )
     accepted = classification == "king_change"
-    if classification == "king_change":
+    if rederive_withheld:
+        status = "rederive_withheld"
+    elif classification == "king_change":
         status = "accepted"
     elif classification == "meaningful_failure":
         status = "meaningful_failure"
@@ -466,6 +484,7 @@ def score_and_decide(
         "decisive": score.decisively_beats_king,
         "accepted": accepted,
         "is_first": is_first,
+        "rederive_withheld": rederive_withheld,
         "result": result,
         "score_report": score,
     }
