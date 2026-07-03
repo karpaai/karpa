@@ -51,6 +51,7 @@ from validator.integrity import (
     check_compute_plausibility,
     check_model_size,
     check_recipe_config_matches_proof,
+    check_training_log_integrity,
     check_training_timing,
 )
 
@@ -403,6 +404,24 @@ def op1_diff_and_integrity(
         ok_c, detail_c = check_compute_plausibility(final_state, calibration)
         if not ok_c:
             return False, detail_c
+        # Fabricated-log guard: reject a training_log forged to disguise a
+        # forged-down wall_clock_s (step-0 compile floor + tokens_per_sec identity
+        # + log/wall consistency). Disable: RALPH_LOG_INTEGRITY_OFF=1.
+        if os.environ.get("RALPH_LOG_INTEGRITY_OFF") != "1":
+            try:
+                _log_rows = [
+                    json.loads(_x)
+                    for _x in (proof_dir / "training" / "training_log.jsonl")
+                    .read_text().splitlines()
+                    if _x.strip()
+                ]
+            except (OSError, ValueError):
+                _log_rows = []
+            ok_l, detail_l, warns_l = check_training_log_integrity(_log_rows, final_state)
+            for _w in warns_l:
+                print(f"[op1] {_w}")
+            if not ok_l:
+                return False, detail_l
         # Compute-budget cap (fair 1x H100-class contest). HARD reject over
         # RALPH_H100H_BUDGET (default 5.0) normalized H100-hours; spoof-proof via a
         # fixed Hopper reference. Disable: RALPH_H100H_GATE_OFF=1.

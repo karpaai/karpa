@@ -151,6 +151,122 @@ def check_compute_plausibility(
     return True, f"compute plausible: {tokens / wall:,.0f} tok/s, {mfu * 100:.0f}% MFU"
 
 
+# --- Training-log integrity (anti fabricated-log / forged-down wall_clock) ------
+#
+# check_compute_plausibility + the compute-budget cap both read
+# final_state.wall_clock_s, but wall_clock_s is miner-authored and never derived
+# from a measured quantity — a forger reports it LOW so a memorization-grade
+# over-budget run lands under both the normalized-H100h cap and the 70% MFU
+# ceiling, then fabricates a training log that agrees with it (observed: elapsed_s
+# exactly linear in step, step-0 elapsed 0.0 at full throughput). This guard
+# cross-checks the log against itself + wall_clock_s using only ARITHMETIC
+# IDENTITIES and a PHYSICAL floor, so it never false-positives on a legit low-jitter
+# (torch.compile) run the way a variance/linearity threshold would.
+DEFAULT_STEP0_FLOOR_S = 1.0
+
+
+def check_training_log_integrity(
+    log_rows: list[dict],
+    final_state: dict,
+    *,
+    step0_floor_s: float = DEFAULT_STEP0_FLOOR_S,
+    tps_tol: float = 0.01,
+    wall_tol_frac: float = 0.02,
+) -> tuple[bool, str, list[str]]:
+    """Reject a fabricated training_log used to disguise a forged-down wall_clock_s.
+
+    Trusts only identities/impossibilities (FP-safe), never a variance test:
+      (1) STEP-0 FLOOR: the first logged step's cumulative elapsed_s must exceed
+          `step0_floor_s` — a real first step pays CUDA-init/compile overhead
+          (legit ~6-8s); a back-computed linear log reports ~0s. Load-bearing.
+      (2) tokens_per_sec IDENTITY: the canonical trainer logs
+          tokens_per_sec == tokens_seen/elapsed_s (cumulative). If the MAJORITY of
+          rows break it beyond `tps_tol`, elapsed and throughput were produced by
+          different processes (fabrication). If NO row satisfies it the recipe
+          redefined tps semantics -> warn + skip, don't reject.
+      (3) WALL CONSISTENCY: the final row's elapsed_s must equal
+          final_state.wall_clock_s within `wall_tol_frac` (same clock).
+
+    A perfectly-linear (machine-generated) elapsed series is returned as a WARNING
+    only (audit trigger) — a legit very-stable run can have near-zero jitter.
+
+    Returns (ok, reason, warnings). ok=False -> reject at op1. NOTE: closes the
+    fabricated-log vector; wall_clock_s stays fundamentally unverifiable without
+    checkpoint-bound re-derivation on canonical data (plan P4).
+    """
+    warnings: list[str] = []
+    rows = [r for r in (log_rows or []) if isinstance(r, dict)]
+    if len(rows) < 2:
+        return True, "log-integrity: too few log rows (deferred)", warnings
+
+    # (1) step-0 compile/init floor — the load-bearing check.
+    e0 = rows[0].get("elapsed_s")
+    if isinstance(e0, (int, float)) and math.isfinite(e0) and e0 < step0_floor_s:
+        return (
+            False,
+            f"fabricated log: step-0 elapsed {e0:.3f}s < {step0_floor_s:.1f}s floor "
+            "(a real first step pays CUDA-init/compile; a back-computed linear log reports ~0)",
+            warnings,
+        )
+
+    # (2) tokens_per_sec == tokens_seen/elapsed_s identity (cumulative).
+    checked = ok_id = bad_id = 0
+    for r in rows:
+        e, ts, tps = r.get("elapsed_s"), r.get("tokens_seen"), r.get("tokens_per_sec")
+        if not all(isinstance(x, (int, float)) and math.isfinite(x) for x in (e, ts, tps)):
+            continue
+        if e <= 0 or ts <= 0 or tps <= 0:
+            continue
+        implied = ts / e
+        checked += 1
+        if abs(tps - implied) / implied <= tps_tol:
+            ok_id += 1
+        else:
+            bad_id += 1
+    if checked >= 4:
+        if ok_id == 0:
+            warnings.append(
+                "log-integrity: tokens_per_sec matches tokens_seen/elapsed_s in NO row "
+                "(non-canonical tps semantics?) — identity check skipped"
+            )
+        elif bad_id > checked // 2:
+            return (
+                False,
+                f"fabricated log: tokens_per_sec disagrees with tokens_seen/elapsed_s in "
+                f"{bad_id}/{checked} rows (elapsed and throughput fabricated independently)",
+                warnings,
+            )
+
+    # (3) final logged elapsed_s must equal final_state.wall_clock_s (same clock).
+    last_e = rows[-1].get("elapsed_s")
+    wall = (final_state or {}).get("wall_clock_s")
+    if (isinstance(last_e, (int, float)) and math.isfinite(last_e) and last_e > 0
+            and isinstance(wall, (int, float)) and math.isfinite(wall) and wall > 0
+            and abs(last_e - wall) / wall > wall_tol_frac):
+        return (
+            False,
+            f"fabricated log: final log elapsed {last_e:.1f}s != wall_clock_s {wall:.1f}s "
+            f"(> {wall_tol_frac:.0%}) — log and reported wall are different clocks",
+            warnings,
+        )
+
+    # WARN-only: degenerate (machine-linear) per-step timing — audit trigger, not a gate.
+    deltas, prev = [], None
+    for r in rows:
+        e, s = r.get("elapsed_s"), r.get("step")
+        if isinstance(e, (int, float)) and isinstance(s, (int, float)) and math.isfinite(e):
+            if prev is not None and s - prev[0] > 0:
+                deltas.append((e - prev[1]) / (s - prev[0]))
+            prev = (s, e)
+    if len(deltas) >= 8 and len({round(d, 6) for d in deltas[:-1]}) <= 1:
+        warnings.append(
+            f"log-integrity: per-step wall-time is a single value across {len(deltas) - 1} "
+            "blocks — perfectly linear elapsed (likely machine-generated); flag for audit"
+        )
+
+    return True, "log-integrity: ok", warnings
+
+
 # --- Compute-budget cap (fair "1x H100-class" contest) ------------------------
 #
 # Cap total normalized H100-hours so the crown is a FIXED compute-budget contest
