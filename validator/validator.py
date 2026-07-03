@@ -524,6 +524,25 @@ def _check_canonical_source_version(proof_dir: Path) -> tuple[bool, str]:
     return True, ""
 
 
+def _expected_container_measurement(ralph_root: Path) -> str:
+    """The container_measurement op2 requires an attestation to bind to.
+
+    PINNED via RALPH_EXPECTED_MEASUREMENT (a 64-hex sha256) when set, so op2 stays
+    anchored to the PUBLISHED prooftest image even while the validator box runs a
+    dev branch / unpushed code whose live proof-source tree would otherwise
+    recompute a value no miner can reproduce (breaking op2 for everyone). Falls back
+    to computing from the live tree (legacy behaviour) when the pin is unset. The
+    pin is not a security relaxation — op2 still requires a real CC attestation
+    binding to this value; it only stops the box's live code silently redefining the
+    target. Update the pin only on a deliberate image cutover.
+    """
+    pin = (os.environ.get("RALPH_EXPECTED_MEASUREMENT") or "").strip().lower()
+    if len(pin) == 64 and all(c in "0123456789abcdef" for c in pin):
+        return pin
+    from ralph_bootstrap import RECIPE_DIR
+    return compute_container_measurement(ralph_root, recipe_dir=RECIPE_DIR)
+
+
 def op2_attestation_verify(
     ralph_root: Path,
     submission_payload: dict,
@@ -558,8 +577,7 @@ def op2_attestation_verify(
 
     att_text = att_path.read_text()
     att_data = json.loads(att_text)
-    from ralph_bootstrap import RECIPE_DIR
-    expected_measurement = compute_container_measurement(ralph_root, recipe_dir=RECIPE_DIR)
+    expected_measurement = _expected_container_measurement(ralph_root)
 
     # B-pin: actionable version-drift error (off unless RALPH_CANONICAL_SOURCE_COMMITS
     # is set). Turns the opaque "container measurement mismatch" into a clear
@@ -620,7 +638,25 @@ def op2_attestation_verify(
         is_real = False
 
     if not ok:
-        return False, f"attestation verification failed ({att_type_label}): " + "; ".join(errors), "rejected"
+        detail = f"attestation verification failed ({att_type_label}): " + "; ".join(errors)
+        # The most common honest-miner failure is a container_measurement mismatch
+        # (built against the wrong ralph/recipe version). The measurement is public
+        # and reproducible, so name the exact expected value + the canonical image
+        # instead of an opaque "mismatch" — miners no longer have to guess.
+        got = getattr(att, "container_measurement", None)
+        if isinstance(got, str) and got and got != expected_measurement:
+            img = os.environ.get(
+                "RALPH_PROOFTEST_IMAGE", "ghcr.io/ralphlabsai/ralph-prooftest:v0.2.4"
+            )
+            detail += (
+                f" | container_measurement mismatch: got {got[:16]}…, "
+                f"expected {expected_measurement[:16]}… — rebuild inside {img} "
+                "(verify: docker run --rm --entrypoint python <img> -c "
+                "\"import ralph_bootstrap; from pathlib import Path; from proof.sources "
+                "import compute_container_measurement as m; "
+                "print(m(Path('/app'), recipe_dir=Path('/app/recipe')))\")"
+            )
+        return False, detail, "rejected"
 
     # Hopper-only hardware bind (fair 1x H100-class contest). Runs AFTER the NRAS
     # ES384 + eat_nonce==handshake_nonce + TDX checks above, and only for real_*
