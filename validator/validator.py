@@ -47,7 +47,9 @@ from proof.sources import compute_container_measurement
 from validator.integrity import (
     check_canonical_data_source,
     check_checkpoint_not_blocklisted,
+    check_compute_budget,
     check_compute_plausibility,
+    check_model_size,
     check_recipe_config_matches_proof,
     check_training_timing,
 )
@@ -401,6 +403,33 @@ def op1_diff_and_integrity(
         ok_c, detail_c = check_compute_plausibility(final_state, calibration)
         if not ok_c:
             return False, detail_c
+        # Compute-budget cap (fair 1x H100-class contest). HARD reject over
+        # RALPH_H100H_BUDGET (default 5.0) normalized H100-hours; spoof-proof via a
+        # fixed Hopper reference. Disable: RALPH_H100H_GATE_OFF=1.
+        if os.environ.get("RALPH_H100H_GATE_OFF") != "1":
+            def _envf(name, default):
+                try:
+                    return float(os.environ.get(name, "") or default)
+                except (TypeError, ValueError):
+                    return default
+            ok_b, detail_b = check_compute_budget(
+                final_state,
+                calibration,
+                budget=_envf("RALPH_H100H_BUDGET", 5.0),
+                mm_ref_hopper=_envf("RALPH_H100H_MM_REF_HOPPER", 0.344),
+            )
+            if not ok_b:
+                return False, detail_b
+        # Model-size cap (fair fixed-arch contest; blocks the big-under-trained
+        # memorizer that fits under the compute budget). Disable: RALPH_MODEL_SIZE_GATE_OFF=1.
+        if os.environ.get("RALPH_MODEL_SIZE_GATE_OFF") != "1":
+            try:
+                _maxn = int(float(os.environ.get("RALPH_MAX_N_PARAMS", "") or 400_000_000))
+            except (TypeError, ValueError):
+                _maxn = 400_000_000
+            ok_sz, detail_sz = check_model_size(final_state, max_n_params=_maxn)
+            if not ok_sz:
+                return False, detail_sz
         # Off-protocol training: a checkpoint attesting to the canonical code cannot
         # have trained longer than that code has existed. Pairs with the MFU gate
         # above (too-long wall_clock here, too-short there). Disable: RALPH_TIMING_GATE_OFF=1.
@@ -573,6 +602,18 @@ def op2_attestation_verify(
 
     if not ok:
         return False, f"attestation verification failed ({att_type_label}): " + "; ".join(errors), "rejected"
+
+    # Hopper-only hardware bind (fair 1x H100-class contest). Runs AFTER the NRAS
+    # ES384 + eat_nonce==handshake_nonce + TDX checks above, and only for real_*
+    # attestations (mocks are already rejected on mainnet). The die rides the
+    # signed, nonce-bound NRAS hwmodel (proof.gpu_arch); GH100 (H100+H200) allowed,
+    # Blackwell/unknown denied. Disable: RALPH_ARCH_GATE_OFF=1.
+    if is_real and os.environ.get("RALPH_ARCH_GATE_OFF") != "1":
+        from proof.gpu_arch import verify_gpu_arch_allowed
+        allow = {c.strip().upper() for c in os.environ.get("RALPH_ALLOWED_GPU_DIES", "GH100").split(",") if c.strip()}
+        arch_ok, arch_reason, _die = verify_gpu_arch_allowed(att_data, allow=allow or {"GH100"})
+        if not arch_ok:
+            return False, f"GPU arch bind failed: {arch_reason}", "rejected"
 
     # v1.2: single attested-execution tier. No α discount.
     detail = f"attestation verified ({att_type_label})"

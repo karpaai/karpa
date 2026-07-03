@@ -151,6 +151,89 @@ def check_compute_plausibility(
     return True, f"compute plausible: {tokens / wall:,.0f} tok/s, {mfu * 100:.0f}% MFU"
 
 
+# --- Compute-budget cap (fair "1x H100-class" contest) ------------------------
+#
+# Cap total normalized H100-hours so the crown is a FIXED compute-budget contest
+# (best recipe wins) rather than "whoever buys the most tokens wins". SPOOF-PROOF:
+# the denominator is a FIXED validator-side Hopper reference (mm_ref_hopper), NOT
+# the miner-reported calibration matmul_ms — a fabricated large matmul_ms cannot
+# shrink the cost under the cap. wall_clock_s is the only miner input, and it is
+# independently lower-bounded by check_compute_plausibility's MFU gate (too-short
+# wall => impossible throughput => rejected there). Pairs with the Hopper arch
+# bind (op2): the die is attested GH100, so one fixed Hopper ref is the right
+# normalizer. Tunable via RALPH_H100H_BUDGET / RALPH_H100H_MM_REF_HOPPER.
+DEFAULT_H100H_BUDGET = 5.0
+DEFAULT_MM_REF_HOPPER = 0.344  # fastest attested Hopper (H200) matmul_ms; conservative (never under-charges)
+
+
+def check_compute_budget(
+    final_state: dict,
+    calibration: dict | None = None,
+    *,
+    budget: float = DEFAULT_H100H_BUDGET,
+    h100_matmul_ms_ref: float | None = None,
+    mm_ref_hopper: float = DEFAULT_MM_REF_HOPPER,
+) -> tuple[bool, str]:
+    """Reject a bundle whose normalized H100-hours exceed `budget`.
+    norm_h100h = (wall_clock_s/3600) * (h100_ref / mm_ref_hopper), using FIXED
+    references so a spoofed calibration matmul_ms cannot duck the cap. Best-effort:
+    incomplete/non-finite wall_clock_s is skipped. Returns (ok, reason)."""
+    fs = final_state or {}
+    try:
+        wall = float(fs.get("wall_clock_s", 0) or 0)
+    except (TypeError, ValueError):
+        return True, "compute-budget: non-numeric wall_clock_s (skipped)"
+    if wall <= 0 or not math.isfinite(wall):
+        return True, "compute-budget: incomplete/non-finite wall_clock_s (skipped)"
+    if h100_matmul_ms_ref is None:
+        try:
+            from validator.scoring import _h100_matmul_ms_ref
+            h100_matmul_ms_ref = _h100_matmul_ms_ref()
+        except Exception:  # noqa: BLE001 — fall back to the calibrated H100 ref
+            h100_matmul_ms_ref = 0.51
+    if mm_ref_hopper <= 0:
+        mm_ref_hopper = DEFAULT_MM_REF_HOPPER
+    norm_h100h = (wall / 3600.0) * (h100_matmul_ms_ref / mm_ref_hopper)
+    if norm_h100h > budget:
+        return False, (
+            f"over compute budget: normalized_H100_hours={norm_h100h:.2f} > cap {budget:.1f} "
+            f"(wall {wall / 3600:.2f}h at fixed Hopper ref {mm_ref_hopper:.3f}ms; miner matmul_ms "
+            f"ignored to prevent spoofing) — exceeds the fair 1x H100-class budget"
+        )
+    return True, f"compute budget ok: {norm_h100h:.2f} H100h <= cap {budget:.1f}"
+
+
+# --- Model-size cap (fair fixed-arch contest) ---------------------------------
+#
+# The compute-budget cap limits FLOPs/wall, not CAPACITY. A big under-trained model
+# (e.g. 1.2B at <1 token/param) fits under the H100-hour budget yet wins on raw
+# capacity / held-out MEMORIZATION rather than recipe quality — the recurring
+# "1.2B, 0.6 tok/param, val_bpb 1.33" fraud class. n_params is un-forgeable: op4
+# builds the model from the declared config and load_state_dict fails if the
+# checkpoint's real shape differs, so a big model cannot masquerade as small.
+# Pins the contest to the canonical ~254M arch class (tunable RALPH_MAX_N_PARAMS).
+DEFAULT_MAX_N_PARAMS = 400_000_000
+
+
+def check_model_size(final_state: dict, *, max_n_params: int = DEFAULT_MAX_N_PARAMS) -> tuple[bool, str]:
+    """Reject a model larger than max_n_params. Best-effort: skipped if n_params
+    is absent/non-numeric. Returns (ok, reason); ok=False -> reject."""
+    fs = final_state or {}
+    try:
+        n = float(fs.get("n_params", 0) or 0)
+    except (TypeError, ValueError):
+        return True, "model-size: non-numeric n_params (skipped)"
+    if n <= 0:
+        return True, "model-size: no n_params (skipped)"
+    if n > max_n_params:
+        return False, (
+            f"model too large: n_params={n / 1e6:.0f}M > cap {max_n_params / 1e6:.0f}M — the 1x-H100 "
+            f"contest is a fixed ~254M-class recipe competition; a bigger under-trained model wins on "
+            f"capacity/held-out-memorization, not recipe quality"
+        )
+    return True, f"model size ok: {n / 1e6:.0f}M <= {max_n_params / 1e6:.0f}M"
+
+
 # --- Training-timing plausibility (anti off-protocol-training) -----------------
 #
 # op2 attestation proves the canonical recipe/runner CODE was present in the
@@ -343,35 +426,55 @@ def check_recipe_config_matches_proof(patch_text: str, final_state: dict) -> tup
     return True, "config matches proof"
 
 
-# Miner-host data paths a canonical run must never reference. The locked
-# canonical data_manifest is relative (e.g. "data/data_manifest.json"); a config
-# that points manifest_path/data_base_dir at /home, /mnt, … is a data-lock bypass
-# (the run trained on the miner's own data, possibly contaminated with the
-# held-out, then claimed the canonical recipe). The in-the-wild case:
-# manifest_path="/home/root/diony/recipe/data/data_manifest.json".
-# ALLOWLIST, not blocklist: canonical data lives at a container-RELATIVE path
-# (e.g. "data/data_manifest.json"), resolved inside the proof container against the
-# canonical recipe tree. ANY absolute path ("/..."), home ("~"), or parent-escape
-# ("..") points outside that tree to a miner-controlled location = a data-lock
-# bypass, regardless of the specific prefix. The old per-prefix blocklist
-# (/home|/mnt|...) missed /dstack; this matches every absolute/escaping path by
-# construction, so there is no prefix left to enumerate around.
+# The canonical data_manifest is the container's relative data/ tree. A config
+# pointing manifest_path/data_base_dir at a home ("~") or parent-escape ("..")
+# path is outside that tree — reject.
+#
+# BUT the canonical proof runner (proof/runner.py) intentionally pins
+# --manifest/--data-base-dir to the RESOLVED-ABSOLUTE container path
+# ((RECIPE_DIR/"data"...).resolve()), and recipe train.py records that verbatim
+# into final_state.config. So the honest, canonical output IS an absolute path
+# like "/workspace/recipe/data/data_manifest.json" or "/dstack/.../recipe/data/…".
+# Rejecting every absolute path therefore false-rejects every honest bundle built
+# by the canonical harness (the miner-reported op1 breakage). We fold an absolute
+# path that passes through the canonical "data" tree back to its relative tail
+# ("…/data/data_manifest.json" -> "data/data_manifest.json") before the check, so
+# the runner's own resolved paths pass; ~ home and .. escapes stay rejected.
+# NOTE: this path check is NOT the data-lock security boundary — the runner PINS
+# the load dir (its CLI arg overrides any config the miner sets), and the
+# container filesystem is miner-owned regardless of the string, so a determined
+# swap is only deterred by re-derivation, not by this regex. Its job is only to
+# not false-reject the honest canonical output while flagging obviously-off paths.
 _NONCANONICAL_PATH_RE = re.compile(r"^\s*(?:~|\.\.|/)")
+_CANONICAL_DATA_TAIL_RE = re.compile(r"(?:^|/)(data(?:/.*)?)$")
+
+
+def _canonical_relative_tail(v: str) -> str:
+    """Fold an absolute path that passes through the canonical 'data' tree back to
+    its container-relative tail (…/data or …/data/… -> 'data[/…]'). ~ home and ..
+    escapes are left untouched (they stay rejected by the allowlist)."""
+    s = v.strip()
+    if s.startswith("/"):
+        m = _CANONICAL_DATA_TAIL_RE.search(s)
+        if m:
+            return m.group(1)
+    return s
 
 
 def check_canonical_data_source(final_state: dict) -> tuple[bool, str]:
     """Reject a bundle whose training config points the data manifest/dir outside
-    the canonical container-relative data tree. NOTE: this lives in
-    `final_state.config`, NOT the patch diff, so the restricted/exploit patch
-    scanners miss it — op1 must check it here. Best-effort: skipped when there is
-    no config. Returns (ok, reason)."""
+    the canonical data tree. The canonical runner's RESOLVED-ABSOLUTE paths are
+    folded to their relative tail first (so they pass); only ~/.. escapes and
+    absolute paths with no canonical 'data' segment are rejected. Lives in
+    `final_state.config` (not the patch), so op1 must check it here. Best-effort:
+    skipped when there is no config. Returns (ok, reason)."""
     cfg = (final_state or {}).get("config") or {}
     for key in ("manifest_path", "data_base_dir", "data_dir", "data_path"):
         v = cfg.get(key)
-        if isinstance(v, str) and v.strip() and _NONCANONICAL_PATH_RE.match(v):
+        if isinstance(v, str) and v.strip() and _NONCANONICAL_PATH_RE.match(_canonical_relative_tail(v)):
             return False, (
-                f"non-canonical data source: config.{key}={v!r} is not a "
-                f"container-relative path — canonical data is the relative data/ "
-                f"tree; any absolute/escaping path bypasses the locked data_manifest"
+                f"non-canonical data source: config.{key}={v!r} does not resolve to the "
+                f"canonical container-relative data/ tree (~/.. escape or an absolute path "
+                f"outside data/) — points at a miner-controlled location"
             )
     return True, "canonical data source"

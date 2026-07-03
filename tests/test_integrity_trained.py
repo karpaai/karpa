@@ -10,12 +10,94 @@ from validator.integrity import (
     check_canonical_data_source,
     check_checkpoint_not_blocklisted,
     check_checkpoint_trained,
+    check_compute_budget,
     check_compute_plausibility,
+    check_model_size,
     check_recipe_config_matches_proof,
     check_training_timing,
     compare_loss_trajectory,
     nats_per_token_from_bpb,
 )
+
+
+# --- compute-budget cap (fair 1x H100-class contest) -------------------------
+def test_budget_rejects_over_cap():
+    # martyniukr (H200): wall 19321s -> ~7.96 norm-H100h at the fixed 0.344 ref.
+    ok, reason = check_compute_budget({"wall_clock_s": 19321.0}, {"matmul_ms": 0.344}, budget=5.0, mm_ref_hopper=0.344)
+    assert not ok and "over compute budget" in reason
+
+
+def test_budget_accepts_under_cap():
+    # revert king c48ad59d: wall 7117s -> ~2.93 norm-H100h.
+    assert check_compute_budget({"wall_clock_s": 7117.0}, {"matmul_ms": 0.344}, budget=5.0, mm_ref_hopper=0.344)[0]
+
+
+def test_budget_spoofproof_matmul_ms():
+    # A fabricated large matmul_ms must NOT shrink the cost under the cap (fixed ref).
+    over = {"wall_clock_s": 19321.0}
+    assert not check_compute_budget(over, {"matmul_ms": 5.0}, budget=5.0, mm_ref_hopper=0.344)[0]
+
+
+def test_budget_skips_without_wall():
+    assert check_compute_budget({"wall_clock_s": 0}, {}, budget=5.0, mm_ref_hopper=0.344)[0]
+
+
+# --- model-size cap (fair fixed-arch contest) --------------------------------
+def test_model_size_rejects_big_undertrained():
+    # taohunter251 / gradient-artist: 1.2B model that fits under the compute budget.
+    ok, reason = check_model_size({"n_params": 1_216_087_552}, max_n_params=400_000_000)
+    assert not ok and "model too large" in reason
+
+
+def test_model_size_accepts_canonical_254m():
+    assert check_model_size({"n_params": 253_874_184}, max_n_params=400_000_000)[0]
+
+
+def test_model_size_skips_without_n_params():
+    assert check_model_size({}, max_n_params=400_000_000)[0]
+    assert check_model_size({"n_params": 0}, max_n_params=400_000_000)[0]
+
+
+# --- Hopper-only GPU arch bind (proof.gpu_arch) ------------------------------
+def _fake_jwt(payload: dict) -> str:
+    import base64
+    import json as _j
+    seg = base64.urlsafe_b64encode(_j.dumps(payload).encode()).rstrip(b"=").decode()
+    return "aGRy." + seg + ".c2ln"  # header.<payload>.sig (sig unchecked here; op2 verifies the real sig)
+
+
+def _gpu_token(hwmodel: str, *, break_digest: bool = False) -> str:
+    import hashlib
+    import json as _j
+    filler = "x" * 80  # keep each JWT > 80 chars so _all_jwts picks it up
+    detached = _fake_jwt({"hwmodel": hwmodel, "eat_nonce": "n", "pad": filler})
+    digest = "deadbeef" * 8 if break_digest else hashlib.sha256(detached.encode()).hexdigest()
+    wrapper = _fake_jwt({"submods": {"GPU-0": ["DIGEST", ["SHA-256", digest]]}, "eat_nonce": "n", "pad": filler})
+    return _j.dumps([wrapper, detached])
+
+
+def test_arch_allows_gh100():
+    from proof.gpu_arch import verify_gpu_arch_allowed
+    ok, _r, die = verify_gpu_arch_allowed({"epochs": [{"gpu_token": _gpu_token("GH100")}]}, allow={"GH100"})
+    assert ok and die == "GH100"
+
+
+def test_arch_denies_blackwell():
+    from proof.gpu_arch import verify_gpu_arch_allowed
+    ok, _r, die = verify_gpu_arch_allowed({"epochs": [{"gpu_token": _gpu_token("GB20X")}]}, allow={"GH100"})
+    assert not ok and die == "GB20X"
+
+
+def test_arch_denies_digest_mismatch():
+    # A swapped-in hwmodel EAT whose sha256 != the signed wrapper commitment.
+    from proof.gpu_arch import verify_gpu_arch_allowed
+    assert not verify_gpu_arch_allowed({"epochs": [{"gpu_token": _gpu_token("GH100", break_digest=True)}]})[0]
+
+
+def test_arch_denies_missing_token():
+    from proof.gpu_arch import verify_gpu_arch_allowed
+    assert not verify_gpu_arch_allowed({"epochs": [{"gpu_token": None}]}, allow={"GH100"})[0]
+    assert not verify_gpu_arch_allowed({"epochs": []}, allow={"GH100"})[0]
 
 
 # --- training-timing gate (anti off-protocol) --------------------------------
@@ -133,21 +215,30 @@ def test_config_match_skips_when_no_config_or_no_steps():
 
 
 # --- canonical data source (anti data-lock-bypass) ---------------------------
-def test_rejects_noncanonical_host_manifest_ea576b0a():
-    fs = {"config": {"manifest_path": "/home/root/diony/recipe/data/data_manifest.json", "data_base_dir": "data"}}
-    ok, reason = check_canonical_data_source(fs)
-    assert not ok and "non-canonical data source" in reason
+def test_accepts_container_mount_absolute_data_path():
+    # The canonical runner pins --manifest/--data-base-dir to the RESOLVED-ABSOLUTE
+    # container path (proof/runner.py); train.py records it verbatim. Different CC
+    # containers mount the recipe at different roots (/workspace, /dstack, /home/...),
+    # all ending in the canonical .../data tree — that's the honest bundle (the
+    # runner's own pin), not a swap. They fold to the relative tail and are accepted;
+    # rejecting them was the miner-reported op1 breakage.
+    for mp in (
+        "/workspace/recipe/data/data_manifest.json",
+        "/dstack/persistent/canon/recipe/data/data_manifest.json",
+        "/home/root/diony/recipe/data/data_manifest.json",
+    ):
+        assert check_canonical_data_source({"config": {"manifest_path": mp}})[0], mp
+    assert check_canonical_data_source({"config": {"data_base_dir": "/workspace/recipe/data"}})[0]
 
 
 def test_rejects_mnt_data_base_dir():
+    # No canonical "data" segment -> stays absolute -> rejected.
     assert not check_canonical_data_source({"config": {"data_base_dir": "/mnt/scratch/SN40/data_50b"}})[0]
 
 
-def test_rejects_dstack_manifest_crazy_m1ner():
-    # The live /dstack bypass the old prefix blocklist (/home|/mnt|...) missed.
-    mp = "/dstack/persistent/canon/recipe/data/data_manifest.json"
-    ok, reason = check_canonical_data_source({"config": {"manifest_path": mp}})
-    assert not ok and "non-canonical data source" in reason
+def test_rejects_absolute_path_outside_data_tree():
+    for mp in ("/home/attacker/evil.bin", "/mnt/scratch/other.json"):
+        assert not check_canonical_data_source({"config": {"manifest_path": mp}})[0], mp
 
 
 def test_rejects_any_absolute_or_escaping_path():
