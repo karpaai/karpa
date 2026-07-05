@@ -1380,10 +1380,25 @@ def _legacy_hidden_eval(
         model = RalphBase(cfg)
         model.load_state_dict(state_dict)
     except RuntimeError as e:
-        # Architecture divergence (a structural patch that adds parameters):
-        # retry under the patched workdir so the actually-trained model scores.
+        # Architecture divergence (a structural patch that adds parameters the validator's
+        # canonical RalphBase does not have — e.g. value_embeddings / readout-calib).
         if _is_state_dict_shape_mismatch(e):
-            return _patched_hidden_eval(ralph_root, proof_dir, ckpt_path)
+            # FAIL CLOSED. Falling back to _patched_hidden_eval would rebuild the model from
+            # the MINER's patched model/ code and run it to compute the crown metric. On this
+            # HOSB-off legacy path that eval is NOT answer-blanked, so the miner's own code
+            # sees the raw held-out and the crown is not independently verifiable — the
+            # value_embeddings/novel-arch exploit (Kaizen0304 2026-07-05). We refuse to crown a
+            # model the validator cannot build + score itself. Arch innovation is re-enabled
+            # under HOSB (answer-blanked eval), or explicitly via RALPH_ALLOW_PATCHED_EVAL=1
+            # (testnet/debug only — do NOT set on mainnet while HOSB is off).
+            import os
+            if os.environ.get("RALPH_ALLOW_PATCHED_EVAL") == "1":
+                return _patched_hidden_eval(ralph_root, proof_dir, ckpt_path)
+            return False, (
+                "arch-divergent checkpoint: does not load into the validator's canonical "
+                "model, and op4 will NOT fall back to the miner's own eval code (HOSB off = "
+                f"not independently verifiable). Rejected. [{str(e)[:100]}]"
+            ), None
         raise
     # The CPU load above only ROUTED canonical-vs-patched; free it and run the GPU
     # forward in a SUBPROCESS so a fatal CUDA fault kills only the child.
