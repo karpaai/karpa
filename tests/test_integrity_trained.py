@@ -221,6 +221,44 @@ def test_accepts_honest_small_batch_run():
     assert check_compute_plausibility(fs, H100)[0]
 
 
+# --- compile-aware ceiling (the 2026-07-04/05 uncompiled-Muon forgery flood) --------
+def test_max_plausible_mfu_compile_aware():
+    # UNCOMPILED recipes are capped at UNCOMPILED_MFU_CEILING (0.35); compiled keep the
+    # micro_batch ceiling. Measured: uncompiled Muon ubatch-128 = ~13% MFU, compiled ~32%.
+    assert max_plausible_mfu(128, 512, recipe_compiles=True) == 0.70   # compiled -> full ceiling
+    assert max_plausible_mfu(128, 512, recipe_compiles=False) == 0.35  # uncompiled -> capped
+    assert max_plausible_mfu(64, 512, recipe_compiles=False) == 0.35   # min(0.60, 0.35) -> capped
+    assert max_plausible_mfu(8, 512, recipe_compiles=False) == 0.33    # min(0.33, 0.35) -> small-batch wins
+    assert max_plausible_mfu(4, 512, recipe_compiles=False) == 0.25    # M=2048 base 0.25 already below cap
+    assert max_plausible_mfu(None, None, recipe_compiles=False) == 0.70  # unknown cfg -> never false-reject
+
+
+def test_rejects_kaizen_uncompiled_forgery():
+    # Kaizen0304 (b1930c27): 356k tok/s at micro_batch=128, muon, NO torch.compile => 54.9%
+    # MFU. Passed the 70% ceiling; measured uncompiled H200 ceiling is 86k (~13% MFU).
+    fs = {"tokens_seen": 4_190_000_000, "wall_clock_s": 11_763, "n_params": 253_874_184,
+          "config": {"micro_batch_size": 128, "seq_len": 512}}  # ~356k tok/s, ~55% MFU
+    ok, reason = check_compute_plausibility(fs, H100, recipe_compiles=False)
+    assert not ok
+    assert "torch.compile" in reason and "compile=NO" in reason
+
+
+def test_rejects_andreastanm_uncompiled_but_accepts_danielortega_compiled():
+    # SAME declared throughput (239k tok/s, ~37% MFU, ubatch-128), opposite verdicts:
+    # andreastanm ran UNCOMPILED (impossible -> reject); danielortega COMPILED (real -> pass).
+    fs = {"tokens_seen": 2_621_440_000, "wall_clock_s": 10_962, "n_params": 253_874_184,
+          "config": {"micro_batch_size": 128, "seq_len": 512}}  # ~239k tok/s, ~37% MFU
+    assert not check_compute_plausibility(fs, H100, recipe_compiles=False)[0]  # andreastanm
+    assert check_compute_plausibility(fs, H100, recipe_compiles=True)[0]       # danielortega
+
+
+def test_accepts_honest_uncompiled_field_run():
+    # 5Fbh5xe (honest, verified): 174k tok/s uncompiled ubatch-128 H200 = ~27% MFU < 35% cap.
+    fs = {"tokens_seen": 1_913_000_000, "wall_clock_s": 10_989, "n_params": 253_874_184,
+          "config": {"micro_batch_size": 128, "seq_len": 512}}  # ~174k tok/s, ~27% MFU
+    assert check_compute_plausibility(fs, H100, recipe_compiles=False)[0]
+
+
 def test_accepts_honest_large_batch_field_runs():
     # The restored king 5CqhtHE7 (ubatch 64, 137k tok/s, ~21% MFU) and 5Fbh5xe (ubatch 128,
     # 174k, ~27%) are physically plausible and must NOT be false-rejected.

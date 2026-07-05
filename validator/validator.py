@@ -236,6 +236,23 @@ def _canonical_code_epoch() -> float | None:
         return None
 
 
+def _recipe_uses_compile(final_state: dict, proof_dir: Path) -> bool:
+    """True only if the recipe ACTUALLY torch.compiles: the config requests it AND the
+    patch adds a torch.compile call. A bare config `compile: true` is a no-op on the
+    canonical recipe (dropped by hasattr in train.py) and cannot be trusted — a forger
+    could set it to earn the higher compiled-MFU ceiling while running uncompiled. This
+    gates the compute-plausibility ceiling: uncompiled Muon tops out ~13-27% MFU
+    (measured), so an uncompiled recipe declaring compiled-grade throughput is forged."""
+    cfg = (final_state or {}).get("config") or {}
+    if not cfg.get("compile"):
+        return False
+    try:
+        patch = (proof_dir / "patch.diff").read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return False
+    return "torch.compile" in patch
+
+
 def op1_diff_and_integrity(
     ralph_root: Path,
     submission_payload: dict,
@@ -401,7 +418,10 @@ def op1_diff_and_integrity(
                 calibration = json.loads(cal_path.read_text(encoding="utf-8", errors="replace"))
             except (ValueError, OSError):
                 calibration = {}
-        ok_c, detail_c = check_compute_plausibility(final_state, calibration)
+        recipe_compiles = _recipe_uses_compile(final_state, proof_dir)
+        ok_c, detail_c = check_compute_plausibility(
+            final_state, calibration, recipe_compiles=recipe_compiles
+        )
         if not ok_c:
             return False, detail_c
         # Fabricated-log guard: reject a training_log forged to disguise a
