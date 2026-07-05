@@ -45,7 +45,7 @@ from chain_layer.config import get_chain
 from validator.hf_poller import DEFAULT_REPO as DEFAULT_HF_REPO
 from validator.hf_poller import poll_hub
 from validator.scoring import score_bundle
-from validator.validator import judge_submission
+from validator.validator import judge_submission, op_compute_remeasure
 
 
 # Bittensor's bt.logging hijacks Python's logging module and raises the root
@@ -428,6 +428,19 @@ def score_and_decide(
     is_first = king is None and hwm is None
     decisively = score.decisively_beats_king or is_first
 
+    # Pre-crown on-GPU throughput re-measurement: run ONLY for a would-be king (cost is
+    # O(king-changes)). enforce withholds the crown when the declared throughput can't be
+    # reproduced on the validator's GPU; off/shadow never block (shadow logs the verdict).
+    # Fail-OPEN on every ambiguity; only PREVENTS a promotion, never dethrones the sitting king.
+    remeasure_withheld = False
+    if decisively:
+        ok_rm, detail_rm = op_compute_remeasure(RALPH_ROOT, bundle_dir)
+        result.operations["op_compute_remeasure"] = {"ok": ok_rm, "detail": detail_rm}
+        if not ok_rm:
+            remeasure_withheld = True
+            decisively = False
+            is_first = False
+
     classification, weight_credit = _classify_outcome(
         decisively=decisively,
         val_bpb=result.hidden_eval.val_bpb,
@@ -436,7 +449,9 @@ def score_and_decide(
         bundle_dir=bundle_dir,
     )
     accepted = classification == "king_change"
-    if classification == "king_change":
+    if remeasure_withheld:
+        status = "remeasure_withheld"
+    elif classification == "king_change":
         status = "accepted"
     elif classification == "meaningful_failure":
         status = "meaningful_failure"
@@ -466,6 +481,7 @@ def score_and_decide(
         "decisive": score.decisively_beats_king,
         "accepted": accepted,
         "is_first": is_first,
+        "remeasure_withheld": remeasure_withheld,
         "result": result,
         "score_report": score,
     }
