@@ -116,8 +116,21 @@ def _gpu_bf16_peak_flops(gpu_name: str | None) -> float:
     return _DEFAULT_PEAK_TFLOPS * 1e12
 
 
-def max_plausible_mfu(micro_batch: int | None, seq_len: int | None) -> float:
-    """Micro-batch-aware MFU ceiling.
+# An UNCOMPILED recipe physically tops out far below a torch.compile'd one: the
+# per-op kernel-launch overhead (esp. Muon's Newton-Schulz loop) dominates. Measured
+# on a real H200 at ubatch-128/seq-512: Muon UNCOMPILED = 86,436 tok/s = ~13% MFU;
+# torch.compile'd = 207,700 tok/s = ~32% MFU (a 2.4x speedup). Honest uncompiled runs
+# observed on-chain: Muon ~13-21%, lighter (AdamW) ~27% (5Fbh5xe). So an uncompiled
+# recipe declaring MFU above this ceiling is a forged-down wall_clock (andreastanm 37%,
+# Kaizen 54.9% — both uncompiled — sailed under the flat 70% cap). Set with ~8pp headroom
+# over the honest uncompiled max (27%). Compiled recipes keep the micro_batch ceiling.
+UNCOMPILED_MFU_CEILING = 0.35
+
+
+def max_plausible_mfu(
+    micro_batch: int | None, seq_len: int | None, recipe_compiles: bool = True
+) -> float:
+    """Micro-batch- AND compile-aware MFU ceiling.
 
     The flat MAX_PLAUSIBLE_MFU cap is blind to micro_batch, which is the loophole a
     forged-down wall_clock exploited: the per-forward matmul M-dimension is
@@ -130,26 +143,31 @@ def max_plausible_mfu(micro_batch: int | None, seq_len: int | None) -> float:
     M=4096->11%, M=16384->15%, M=32768->21%, M=65536->27%), so honest runs — even
     well-optimized ones — never trip them; only physically-impossible small-batch
     throughput does. Unknown/zero config -> fall back to the flat cap (never false-reject).
-    NOTE: a static ceiling only halves the forgery window (~6x -> ~3x at small batch); the
-    airtight fix is on-GPU throughput re-measurement (a pre-crown, would-beat-king gate).
+
+    recipe_compiles=False (no real torch.compile in the recipe) tightens the ceiling to
+    UNCOMPILED_MFU_CEILING — the class that flooded 2026-07-04/05: Muon runs that declare
+    a torch.compile-grade throughput without actually compiling. NOTE: a static ceiling
+    only narrows the window; the airtight fix is on-GPU throughput re-measurement.
     """
     try:
         m = int(micro_batch or 0) * int(seq_len or 0)
     except (TypeError, ValueError):
         return MAX_PLAUSIBLE_MFU
     if m <= 0:
-        return MAX_PLAUSIBLE_MFU
+        return MAX_PLAUSIBLE_MFU  # unknown config -> flat cap, never false-reject
     if m >= 65536:
-        return 0.70
-    if m >= 32768:
-        return 0.60
-    if m >= 16384:
-        return 0.50
-    if m >= 8192:
-        return 0.42
-    if m >= 4096:
-        return 0.33
-    return 0.25
+        base = 0.70
+    elif m >= 32768:
+        base = 0.60
+    elif m >= 16384:
+        base = 0.50
+    elif m >= 8192:
+        base = 0.42
+    elif m >= 4096:
+        base = 0.33
+    else:
+        base = 0.25
+    return min(base, UNCOMPILED_MFU_CEILING) if not recipe_compiles else base
 
 
 def check_compute_plausibility(
@@ -157,16 +175,18 @@ def check_compute_plausibility(
     calibration: dict | None = None,
     *,
     max_mfu: float = MAX_PLAUSIBLE_MFU,
+    recipe_compiles: bool = True,
 ) -> tuple[bool, str]:
     """Reject a bundle whose declared training throughput is physically impossible.
 
     tokens_seen / wall_clock_s implies ~6*N FLOPs/token; over the declared GPU's
-    bf16 peak that is the achieved MFU. The ceiling is micro-batch-aware
-    (max_plausible_mfu): the flat cap is too loose at small micro_batch, where the GPU
-    is underutilized and high MFU is physically impossible. An implied MFU over the
+    bf16 peak that is the achieved MFU. The ceiling is micro-batch- AND compile-aware
+    (max_plausible_mfu): the flat cap is too loose at small micro_batch and for
+    uncompiled recipes, where high MFU is physically impossible. An implied MFU over the
     ceiling means the wall_clock_s (and the efficiency-gate compute cost it drives) is
-    fabricated. Best-effort: a missing/incomplete training_summary is skipped (deferred
-    to the other gates), not rejected. Returns (ok, reason); ok=False -> reject.
+    fabricated. recipe_compiles=False (no real torch.compile) tightens the ceiling.
+    Best-effort: a missing/incomplete training_summary is skipped (deferred to the other
+    gates), not rejected. Returns (ok, reason); ok=False -> reject.
     """
     fs = final_state or {}
     try:
@@ -179,8 +199,11 @@ def check_compute_plausibility(
         return True, "compute-plausibility: incomplete training_summary (skipped)"
     gpu = (calibration or {}).get("gpu_name") or fs.get("gpu_name") or fs.get("device") or ""
     cfg = fs.get("config") or {}
-    # micro-batch-aware ceiling, tightened by any explicitly-passed max_mfu.
-    ceiling = min(max_mfu, max_plausible_mfu(cfg.get("micro_batch_size"), cfg.get("seq_len")))
+    # micro-batch- + compile-aware ceiling, tightened by any explicitly-passed max_mfu.
+    ceiling = min(
+        max_mfu,
+        max_plausible_mfu(cfg.get("micro_batch_size"), cfg.get("seq_len"), recipe_compiles),
+    )
     flops_per_s = 6.0 * n * tokens / wall  # 6N FLOPs/token (fwd+bwd)
     mfu = flops_per_s / _gpu_bf16_peak_flops(gpu)
     if mfu > ceiling:
@@ -189,13 +212,22 @@ def check_compute_plausibility(
             f" at micro_batch={mb}, seq_len={sl} (effective batch {int(mb) * int(sl)} tokens/fwd)"
             if isinstance(mb, int) and isinstance(sl, int) else ""
         )
+        why = (
+            "the recipe does NOT use torch.compile, so this MFU is physically impossible "
+            "(uncompiled Muon tops out ~13-27% MFU, measured)"
+            if not recipe_compiles
+            else "small micro_batch underutilizes the GPU, so this throughput is physically impossible"
+        )
         return False, (
             f"fabricated compute: {tokens / wall:,.0f} tok/s for a {n / 1e6:.0f}M model on "
-            f"'{gpu or 'unknown'}' => {mfu * 100:.0f}% MFU (> {ceiling * 100:.0f}% ceiling{batch_note}); "
-            f"wall_clock_s={wall:.0f}s for {tokens:,.0f} tokens is not achievable — small micro_batch "
-            f"underutilizes the GPU, so this throughput is physically impossible"
+            f"'{gpu or 'unknown'}' => {mfu * 100:.0f}% MFU (> {ceiling * 100:.0f}% ceiling{batch_note}, "
+            f"compile={'yes' if recipe_compiles else 'NO'}); wall_clock_s={wall:.0f}s for "
+            f"{tokens:,.0f} tokens is not achievable — {why}"
         )
-    return True, f"compute plausible: {tokens / wall:,.0f} tok/s, {mfu * 100:.0f}% MFU (ceiling {ceiling * 100:.0f}%)"
+    return True, (
+        f"compute plausible: {tokens / wall:,.0f} tok/s, {mfu * 100:.0f}% MFU "
+        f"(ceiling {ceiling * 100:.0f}%, compile={'yes' if recipe_compiles else 'no'})"
+    )
 
 
 # --- Training-log integrity (anti fabricated-log / forged-down wall_clock) ------
