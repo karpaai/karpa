@@ -236,6 +236,188 @@ def _canonical_code_epoch() -> float | None:
         return None
 
 
+# --- On-GPU throughput re-measurement (the airtight compute-forgery gate) --------
+#
+# op1's MFU ceiling (check_compute_plausibility) is a static heuristic — it narrows the
+# forgery window but cannot know a specific recipe's real achievable throughput. This gate
+# MEASURES it: re-run the challenger's EXACT config for K steps on the validator's own GPU
+# (synthetic data — throughput is data-independent) and reject if the DECLARED tok/s
+# exceeds the measured achievable by more than a GPU-scaled margin. There is nothing to
+# game: it is the physical rate the forger lies about. Expensive (GPU-minutes, incl. any
+# torch.compile autotune) -> the CALLER runs it ONLY for a would-be king. off/shadow/
+# enforce via RALPH_COMPUTE_REMEASURE; every ambiguity fails OPEN (never a false-reject on
+# a validator glitch — a failed verdict only WITHHOLDS a promotion, never dethrones).
+def _remeasure_mode() -> str:
+    import os
+    v = os.environ.get("RALPH_COMPUTE_REMEASURE", "").strip().lower()
+    if v in ("1", "on", "true", "enforce"):
+        return "enforce"
+    if v == "shadow":
+        return "shadow"
+    return "off"
+
+
+def _remeasure_verdict(
+    declared_tps: float, measured_tps: float, declared_gpu: str,
+    validator_gpu: str, margin: float,
+) -> tuple[bool, str]:
+    """Pure verdict: is the declared throughput achievable given what the validator
+    re-measured on its OWN GPU? Scales the measurement to the miner's declared GPU by bf16
+    peak (H100<->H200 == 1.0 by peak; the margin absorbs memory-bandwidth + torch-version
+    + thermal variance, e.g. danielortega's legit +15%). ok=True iff
+    declared <= measured * gpu_scale * margin. Unit-tested (no GPU)."""
+    from validator.integrity import _gpu_bf16_peak_flops
+    if measured_tps <= 0:
+        return True, "re-measure inconclusive (no measured throughput)"
+    gpu_scale = _gpu_bf16_peak_flops(declared_gpu) / _gpu_bf16_peak_flops(validator_gpu)
+    ceiling = measured_tps * gpu_scale * margin
+    ratio = declared_tps / measured_tps
+    detail = (
+        f"declared {declared_tps:,.0f} tok/s vs re-measured {measured_tps:,.0f} on "
+        f"'{validator_gpu or 'validator-GPU'}' (declared '{declared_gpu or '?'}', "
+        f"scale {gpu_scale:.2f}, margin {margin:.1f}x -> ceiling {ceiling:,.0f}; ratio {ratio:.1f}x)"
+    )
+    return declared_tps <= ceiling, detail
+
+
+def _validator_gpu_name() -> str:
+    """The validator's own GPU name, for scaling the re-measurement. Best-effort."""
+    import subprocess
+    try:
+        out = subprocess.run(
+            ["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"],
+            capture_output=True, text=True, timeout=10,
+        )
+        if out.returncode == 0 and out.stdout.strip():
+            return out.stdout.strip().splitlines()[0].strip()
+    except Exception:  # noqa: BLE001
+        pass
+    return ""
+
+
+def _run_throughput_probe(recipe_dir: Path, proof_dir: Path, cfg: dict) -> float | None:
+    """Re-run the miner's config for K steps on synthetic data; return steady-state tok/s
+    (skipping step-0 warmup/compile), or None on any failure/timeout."""
+    import os
+    import shutil
+    import subprocess
+    import tempfile
+    import time
+
+    from proof.runner import _sanitized_env, apply_patch
+    K = int(os.environ.get("RALPH_REMEASURE_STEPS", "30"))
+    timeout_s = int(os.environ.get("RALPH_REMEASURE_TIMEOUT_S", "1500"))
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp_p = Path(tmp)
+        workdir = tmp_p / "workdir"
+        for sub in ("model", "recipe", "data", "configs"):
+            src = recipe_dir / sub
+            if src.exists():
+                shutil.copytree(src, workdir / sub, dirs_exist_ok=True)
+        patch = proof_dir / "patch.diff"
+        if patch.exists():
+            try:
+                apply_patch(workdir, patch)
+            except Exception:  # noqa: BLE001
+                return None
+        env = _sanitized_env(extra={
+            "PYTHONPATH": str(workdir),
+            "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
+        })
+        data_dir = workdir / "data"
+        try:  # synthetic shards — throughput is data-independent
+            subprocess.run(
+                [sys.executable, "-m", "data.prepare", "--source", "synthetic",
+                 "--out", str(data_dir / "shards"), "--shard-tokens", "5000000",
+                 "--total-tokens", "40000000",
+                 "--manifest", str(data_dir / "data_manifest.json")],
+                cwd=str(workdir), env=env, timeout=300,
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            )
+        except (subprocess.SubprocessError, OSError):
+            return None
+        probe_cfg = dict(cfg)
+        probe_cfg["total_steps"] = K
+        probe_cfg["log_every"] = max(1, K // 5)
+        cfg_file = tmp_p / "probe_cfg.json"
+        cfg_file.write_text(json.dumps(probe_cfg))
+        out_dir = tmp_p / "out"
+        out_dir.mkdir()
+        train_py = workdir / "recipe" / "train.py"
+        if not train_py.exists():
+            return None
+        cmd = [
+            sys.executable, str(train_py), "--config", str(cfg_file),
+            "--manifest", str(data_dir / "data_manifest.json"),
+            "--data-base-dir", str(data_dir), "--out-dir", str(out_dir),
+        ]
+        proc = subprocess.Popen(cmd, cwd=str(workdir), env=env,
+                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        rlog = out_dir / "training_log.jsonl"
+        start = time.time()
+        while time.time() - start < timeout_s:
+            if proc.poll() is not None:
+                break
+            time.sleep(3)
+        if proc.poll() is None:
+            proc.terminate()
+            try:
+                proc.wait(timeout=20)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+        if not rlog.exists():
+            return None
+        try:
+            rows = [json.loads(ln) for ln in rlog.read_text().splitlines() if ln.strip()]
+        except ValueError:
+            return None
+        warm = max(2, K // 5)  # skip step-0 (compile) + warmup
+        steady = [r for r in rows
+                  if int(r.get("step", 0)) >= warm and "elapsed_s" in r and "tokens_seen" in r]
+        if len(steady) < 2:
+            return None
+        dt = steady[-1]["elapsed_s"] - steady[0]["elapsed_s"]
+        dtok = steady[-1]["tokens_seen"] - steady[0]["tokens_seen"]
+        return dtok / dt if dt > 0 else None
+
+
+def op_compute_remeasure(ralph_root: Path, proof_dir: Path) -> tuple[bool, str]:
+    """Pre-crown, would-beat-king-only compute re-measurement (see module comment).
+    off/shadow/enforce via RALPH_COMPUTE_REMEASURE; every ambiguity fails OPEN."""
+    import os
+    mode = _remeasure_mode()
+    if mode == "off":
+        return True, "compute re-measure disabled"
+    from ralph_bootstrap import RECIPE_DIR
+    fs_path = proof_dir / "training" / "final_state.json"
+    if not fs_path.exists():
+        return True, "re-measure skipped: no final_state"
+    try:
+        fs = json.loads(fs_path.read_text())
+    except (OSError, ValueError):
+        return True, "re-measure skipped: unreadable final_state"
+    cfg = fs.get("config") or {}
+    try:
+        tokens = float(fs.get("tokens_seen", 0) or 0)
+        wall = float(fs.get("wall_clock_s", 0) or 0)
+    except (TypeError, ValueError):
+        return True, "re-measure skipped: non-numeric final_state"
+    if tokens <= 0 or wall <= 0 or not cfg:
+        return True, "re-measure skipped: incomplete final_state/config"
+    declared_tps = tokens / wall
+    declared_gpu = str(fs.get("gpu_name") or fs.get("device") or "")
+    measured_tps = _run_throughput_probe(RECIPE_DIR, proof_dir, cfg)
+    if measured_tps is None or measured_tps <= 0:
+        return True, "re-measure inconclusive (probe failed/timed out) -> skip"
+    margin = float(os.environ.get("RALPH_REMEASURE_MARGIN", "1.6") or 1.6)
+    ok, detail = _remeasure_verdict(
+        declared_tps, measured_tps, declared_gpu, _validator_gpu_name(), margin
+    )
+    if mode == "shadow":
+        return True, f"[shadow] would_{'PASS' if ok else 'REJECT'}: {detail}"
+    return ok, (("compute re-measure OK: " if ok else "fabricated compute (re-measured): ") + detail)
+
+
 def op1_diff_and_integrity(
     ralph_root: Path,
     submission_payload: dict,
