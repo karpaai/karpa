@@ -218,9 +218,11 @@ def list_remote_submissions(repo_id: str, token: Optional[str] = None) -> list[d
             continue
         if len(own) > 1:
             print(f"[hf_poller] PR #{d.num}: multiple candidate bundles {own}; taking all")
+        author = getattr(d, "author", None)
         for bid in own:
             pending.append(
-                {"bundle_id": bid, "pr_num": d.num, "git_ref": ref, "created_at": created_at}
+                {"bundle_id": bid, "pr_num": d.num, "git_ref": ref,
+                 "created_at": created_at, "author": author}
             )
 
     # First-come-first-validate: oldest PR first. created_at is ISO-8601 UTC so
@@ -269,6 +271,86 @@ def _close_pr_wrong_key(
         )
     except Exception as e:  # noqa: BLE001 — PR-close is best-effort; never block dedup
         print(f"[hf_poller] WARN: could not close PR #{pr_num} ({bundle_id[:8]}): {e}")
+
+
+# --- Banned-submitter gate: close the PR instead of scoring a blocklisted identity -----
+# Kaizen0304 (5H3xirPk) spammed 10 exploit bundles (compute-forged + value_embeddings
+# arch-bypass). Instead of blocklisting each checkpoint after it lands, refuse the
+# SUBMITTER: if the bundle's hotkey/github — or the HF account that opened the PR — is on
+# the ban list, close the PR (HF proof-bundles PR + the linked GitHub recipe PR) and never
+# score it. The ban list is DATA (chain/banned_miners.json), so identities are added/removed
+# without a code change: {"hotkeys": ["5H3xirPk"], "github": ["kaizen0304"], "hf_users": [...]}.
+def _load_banned_miners() -> dict:
+    p = Path(os.environ.get("RALPH_ROOT", ".")) / "chain" / "banned_miners.json"
+    try:
+        d = json.loads(p.read_text())
+    except (OSError, ValueError):
+        return {"hotkeys": [], "github": [], "hf_users": []}
+    return {
+        "hotkeys": [str(x) for x in d.get("hotkeys", []) if x],
+        "github": [str(x).lower() for x in d.get("github", []) if x],
+        "hf_users": [str(x).lower() for x in d.get("hf_users", []) if x],
+    }
+
+
+def _submission_ban_reason(submission: dict, banned: dict) -> Optional[str]:
+    """Ban reason from the decrypted submission (hotkey prefix or github login), else None."""
+    hk = str(submission.get("miner_hotkey", ""))
+    gh = str(submission.get("miner_github", "")).lower()
+    if any(hk.startswith(b) for b in banned["hotkeys"]):
+        return f"hotkey {hk[:14]}…"
+    if gh and gh in banned["github"]:
+        return f"github {gh}"
+    return None
+
+
+def _hf_user_ban_reason(author: Optional[str], banned: dict) -> Optional[str]:
+    a = str(author or "").lower()
+    return f"HF account {author}" if a and a in banned["hf_users"] else None
+
+
+def _gh_close_pr(pr_url: Optional[str], token: Optional[str], msg: str) -> None:
+    """Best-effort close a GitHub recipe PR (comment + state=closed) via the bot token."""
+    import re
+    import urllib.request
+    m = re.match(r"https?://github\.com/([^/]+/[^/]+)/pull/(\d+)", str(pr_url or ""))
+    if not m or not token:
+        return
+    repo, num = m.group(1), m.group(2)
+
+    def _call(path: str, body: dict, method: str) -> None:
+        req = urllib.request.Request(
+            "https://api.github.com" + path, data=json.dumps(body).encode(),
+            headers={"Authorization": f"Bearer {token}",
+                     "Accept": "application/vnd.github+json",
+                     "Content-Type": "application/json"}, method=method)
+        urllib.request.urlopen(req, timeout=20).read()
+    try:
+        _call(f"/repos/{repo}/issues/{num}/comments", {"body": msg}, "POST")
+        _call(f"/repos/{repo}/pulls/{num}", {"state": "closed"}, "PATCH")
+        print(f"[hf_poller] BANNED: closed GitHub PR {repo}#{num}")
+    except Exception as e:  # noqa: BLE001
+        print(f"[hf_poller] WARN: could not close GitHub PR {pr_url}: {e}")
+
+
+def _close_pr_banned(
+    repo_id: str, pr_num: Optional[int], token: Optional[str], bundle_id: str,
+    which: str, gh_pr_url: Optional[str] = None,
+) -> None:
+    """Close the HF PR (+ best-effort the linked GitHub recipe PR) for a banned submitter."""
+    msg = (
+        f"This submission is from a banned identity ({which}) and will not be scored. "
+        "The account has been blocklisted for repeated protocol violations. PR closed."
+    )
+    if pr_num is not None:
+        try:
+            from huggingface_hub import HfApi
+            HfApi(token=token).change_discussion_status(
+                repo_id=repo_id, discussion_num=pr_num, new_status="closed", comment=msg)
+            print(f"[hf_poller] BANNED: closed HF PR #{pr_num} ({bundle_id[:8]}, {which})")
+        except Exception as e:  # noqa: BLE001
+            print(f"[hf_poller] WARN: could not close HF PR #{pr_num}: {e}")
+    _gh_close_pr(gh_pr_url, os.environ.get("RALPH_BOT_GH_TOKEN"), msg)
 
 
 def download_one(
@@ -393,6 +475,21 @@ def download_one(
             return "stalled"  # fetch timed out — transient; caller counts + eventually skips
         return "unavailable"  # transient (network / mid-upload) — safe to retry
 
+    # Banned-submitter gate: if the decrypted submission is from a banned hotkey/github,
+    # close the PR (HF + linked GitHub recipe PR) and skip scoring entirely.
+    sub_path = out / "submission.json"
+    if sub_path.exists():
+        try:
+            submission = json.loads(sub_path.read_text())
+        except (OSError, ValueError):
+            submission = {}
+        ban_reason = _submission_ban_reason(submission, _load_banned_miners())
+        if ban_reason:
+            _close_pr_banned(repo_id, pr_num, token, bundle_id, ban_reason,
+                             gh_pr_url=submission.get("pr_url"))
+            shutil.rmtree(out, ignore_errors=True)
+            return "banned"
+
     # Annotate which PR this came from so the validator can merge later.
     if pr_num is not None:
         (out / ".hf_pr.json").write_text(json.dumps(
@@ -440,9 +537,18 @@ def poll_hub(
     summary = [(p["bundle_id"][:8], f"PR#{p['pr_num']}") for p in new[:limit]]
     print(f"[hf_poller] found {len(new)} new PR-bundle(s) on HF Hub: {summary}")
 
+    banned_cfg = _load_banned_miners()
     downloaded = []
     for sub in new[:limit]:
         bid = sub["bundle_id"]
+        # Banned HF account (the PR opener): close the PR without even downloading.
+        hf_reason = _hf_user_ban_reason(sub.get("author"), banned_cfg)
+        if hf_reason:
+            _close_pr_banned(repo_id, sub["pr_num"], token, bid, hf_reason)
+            processed[bid] = VALIDATOR_VERSION
+            _STALL_COUNTS.pop(bid, None)
+            print(f"[hf_poller] {bid[:8]}: BANNED ({hf_reason}) — PR closed, marked done")
+            continue
         print(f"[hf_poller] downloading {bid} from PR #{sub['pr_num']} ({sub['git_ref']})...")
         result = download_one(bid, repo_id, pending, token=token,
                               git_ref=sub["git_ref"], pr_num=sub["pr_num"],
@@ -451,6 +557,11 @@ def poll_hub(
             downloaded.append(bid)
             processed[bid] = VALIDATOR_VERSION
             _STALL_COUNTS.pop(bid, None)
+        elif result == "banned":
+            # Banned submitter (hotkey/github). PR closed; stamp done so it stops churning.
+            processed[bid] = VALIDATOR_VERSION
+            _STALL_COUNTS.pop(bid, None)
+            print(f"[hf_poller] {bid[:8]}: BANNED submitter — marked done (PR closed)")
         elif result == "decrypt_failed":
             # Permanent (wrong/rotated seal key). Stamp done so we don't re-poll +
             # re-close it every epoch — the PR was closed with re-seal instructions.
