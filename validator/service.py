@@ -1244,8 +1244,28 @@ def run_epoch(
         archive_bundle(bundle_dir, queue_dir, "scored")
 
     # §5.6 pool split: 90% king, 10% to meaningful_failures (equal split).
-    # If no meaningful_failures this epoch, king gets 100%.
-    round_scores = _apply_pool_split(chain, king_change_hotkey, meaningful_failure_hotkeys)
+    # ROLLING pool: recent meaningful failures keep sharing the 10% until they age
+    # out (RALPH_MF_WINDOW_BLOCKS) so a contributor isn't dropped the instant a quiet
+    # epoch re-asserts king=100%. Deduped by COLDKEY so a sybil (many hotkeys / one
+    # coldkey) gets ONE share, not one-per-hotkey. RALPH_MF_ROLLING_OFF=1 -> per-epoch.
+    if os.environ.get("RALPH_MF_ROLLING_OFF") == "1":
+        _mf_for_split = meaningful_failure_hotkeys
+    else:
+        from validator.mf_pool import active_hotkeys, load_pool, save_pool, update_pool
+        _mfp = update_pool(load_pool(chain_dir), meaningful_failure_hotkeys, epoch_start_block)
+        save_pool(chain_dir, _mfp)
+        _h2c, _reg = {}, None
+        _mg = getattr(chain, "metagraph", None)
+        if _mg is not None:
+            try:
+                _h2c = {h: c for h, c in zip(list(_mg.hotkeys), list(_mg.coldkeys))}
+                _reg = set(_mg.hotkeys)
+            except Exception:  # noqa: BLE001
+                _h2c, _reg = {}, None
+        _mf_for_split = active_hotkeys(_mfp, _h2c, _reg)
+        if _mf_for_split:
+            log_info(f"meaningful-failure pool: {len(_mf_for_split)} operator(s) share 10% (rolling window)")
+    round_scores = _apply_pool_split(chain, king_change_hotkey, _mf_for_split)
 
     # Merge any weights recovered from a previous rate-limited epoch so we don't
     # lose an unlanded meaningful_failure credit — but NEVER resurrect a king the
