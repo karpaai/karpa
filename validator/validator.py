@@ -1573,6 +1573,105 @@ def op4_hidden_eval(
     return ok, detail, result
 
 
+def _memgate_mode() -> str:
+    import os
+    return os.environ.get("RALPH_MEMGATE", "off").strip().lower()
+
+
+def _memgate_reference(eval_dir, p_tokens, f_tokens, seq_len, device):
+    """Cache the clean GPT-2 reference window-means keyed by the (P, F, seq_len) content
+    hash so GPT-2 runs ONCE per shard-pair, not once per submission."""
+    import hashlib
+    import numpy as np
+    from eval.memorization import reference_window_means
+    key = hashlib.sha256(
+        p_tokens.tobytes() + b"|" + f_tokens.tobytes() + b"|" + str(seq_len).encode()
+    ).hexdigest()[:16]
+    cache = Path(eval_dir) / f".memgate_ref_{key}.npz"
+    if cache.exists():
+        try:
+            d = np.load(cache)
+            return d["r_p"], d["r_f"]
+        except (OSError, ValueError):
+            pass
+    r_p, r_f = reference_window_means(p_tokens, f_tokens, seq_len, device)
+    try:
+        np.savez(cache, r_p=r_p, r_f=r_f)
+    except OSError:
+        pass
+    return r_p, r_f
+
+
+def _memgate_shadow_log(ralph_root, proof_dir, v) -> None:
+    try:
+        rec = {"bundle": proof_dir.name}
+        rec.update({k: v.get(k) for k in ("ok", "dd", "tail_frac", "m_adv", "r_adv", "detail")})
+        with (Path(ralph_root) / "memgate_shadow.jsonl").open("a") as f:
+            f.write(json.dumps(rec) + "\n")
+    except OSError:
+        pass
+
+
+def op_memorization_gate(ralph_root: Path, proof_dir: Path, chain=None):
+    """op4b: reject a checkpoint that MEMORIZED the held-out (trained on the eval shard),
+    which every compute/arch/attestation gate AND HOSB is blind to (the fraud lives in the
+    loss surface, not the code path). Difference-in-differences vs a clean GPT-2 reference on
+    the pinned shard P vs a FRESH disjoint control F -- the exact control that caught the
+    2026-07-06 fraud king (canonical ckpt, all gates green, worse than GPT-2 on fresh text).
+
+    RALPH_MEMGATE: off (default) / shadow (log to memgate_shadow.jsonl, never rejects) /
+    enforce (fail-CLOSED). Needs a fresh control at eval/private/fresh_control.bin (or
+    RALPH_MEMGATE_FRESH); the control MUST never overlap training -- in the durable design it
+    is drawn POST-COMMIT (recency-gating) so no frozen model can have trained on it. Fail-OPEN
+    + loud if the control is missing (it IS the test) or on any infra error (never crash the
+    epoch loop). Efficiency: like op_rederive_trajectory this should ideally run only for a
+    would-beat-king bundle; today it runs for every op4-passing submission when enabled.
+    """
+    import os
+    mode = _memgate_mode()
+    if mode not in ("shadow", "enforce"):
+        return True, "memgate off", None
+    eval_dir = ralph_root / "eval" / "private"
+    p_path = eval_dir / "active_tokens.bin"
+    f_path = Path(os.environ.get("RALPH_MEMGATE_FRESH", str(eval_dir / "fresh_control.bin")))
+    if not p_path.exists() or not f_path.exists():
+        return True, f"memgate skipped: fresh control {f_path.name} not materialized", None
+    try:
+        import torch
+        from eval.val_bpb import load_eval_tokens, pinned_eval_seq_len
+        from eval.memorization import run_memorization_gate
+        ckpt = proof_dir / "training" / "checkpoint.pt"
+        saved = _safe_load_checkpoint_config(ckpt)
+        sd = _safe_load_checkpoint_weights(ckpt)
+        cfg = RalphConfig(
+            vocab_size=saved["vocab_size"], dim=saved["dim"], n_layers=saved["n_layers"],
+            n_heads=saved["n_heads"], head_dim=saved["head_dim"],
+            ffn_mult=saved.get("ffn_mult", 8 / 3), max_seq_len=saved["max_seq_len"],
+        )
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        model = RalphBase(cfg).to(device).eval().to(torch.bfloat16)
+        model.load_state_dict(sd)
+        seq_len = pinned_eval_seq_len(saved["max_seq_len"])
+        p_tokens = load_eval_tokens(p_path)
+        f_tokens = load_eval_tokens(f_path)
+        ref = _memgate_reference(eval_dir, p_tokens, f_tokens, seq_len, device)
+        v = run_memorization_gate(
+            model, p_tokens, f_tokens, seq_len, device, ref_window_means=ref,
+            tau=_envf("RALPH_MEMGATE_TAU", 0.15),
+            tau_tail=_envf("RALPH_MEMGATE_TAU_TAIL", 0.05),
+        )
+        del model
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    except Exception as e:  # noqa: BLE001 -- memgate must never crash the epoch loop
+        return True, f"memgate error (skipped): {e}", None
+    if mode == "shadow":
+        _memgate_shadow_log(ralph_root, proof_dir, v)
+        return True, f"memgate shadow (would-{'pass' if v['ok'] else 'REJECT'}): {v['detail']}", v
+    return v["ok"], v["detail"], v
+
+
+
 def judge_submission(
     ralph_root: Path,
     proof_dir: Path,
@@ -1644,6 +1743,16 @@ def judge_submission(
         result.rejected = ValidatorReject("op4_hidden_eval", detail)
         return result
     result.hidden_eval = hidden_eval
+
+    # op4b: memorization gate (RALPH_MEMGATE). Rejects a checkpoint that trained on the
+    # held-out (invisible to op1-op4 + HOSB). Fail-closed in enforce; shadow only logs.
+    ok_m, detail_m, mem_stats = op_memorization_gate(ralph_root, proof_dir, chain=chain)
+    result.operations["op4b_memorization_gate"] = {"ok": ok_m, "detail": detail_m}
+    if mem_stats is not None:
+        result.operations["op4b_memorization_gate"]["stats"] = mem_stats
+    if not ok_m:
+        result.rejected = ValidatorReject("op4b_memorization_gate", detail_m)
+        return result
 
     # Attach training + calibration summaries for downstream scoring.
     final_state_path = proof_dir / "training" / "final_state.json"
