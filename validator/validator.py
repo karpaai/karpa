@@ -1655,6 +1655,12 @@ def op_memorization_gate(ralph_root: Path, proof_dir: Path, chain=None):
         p_tokens = load_eval_tokens(p_path)
         f_tokens = load_eval_tokens(f_path)
         ref = _memgate_reference(eval_dir, p_tokens, f_tokens, seq_len, device)
+
+        def _envf(name, default):
+            try:
+                return float(os.environ.get(name, default))
+            except (TypeError, ValueError):
+                return default
         v = run_memorization_gate(
             model, p_tokens, f_tokens, seq_len, device, ref_window_means=ref,
             tau=_envf("RALPH_MEMGATE_TAU", 0.15),
